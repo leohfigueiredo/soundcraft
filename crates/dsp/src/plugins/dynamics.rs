@@ -31,7 +31,7 @@ fn ballistic(state: f32, target: f32, att: f32, rel: f32) -> f32 {
 
 // ---------------------------------------------------------------------------------------------
 
-static COMP_PARAMS: [ParamInfo; 11] = [
+static COMP_PARAMS: [ParamInfo; 12] = [
     lin("threshold", "Threshold", -60.0, 0.0, -20.0, Unit::Db),
     log("ratio", "Ratio", 1.0, 100.0, 4.0, Unit::Ratio),
     log("attack", "Attack", 0.01, 300.0, 10.0, Unit::Ms),
@@ -43,6 +43,7 @@ static COMP_PARAMS: [ParamInfo; 11] = [
     toggle("limiter", "Limit", false),
     lin("lookahead", "Lookahead", 0.0, 10.0, 0.0, Unit::Ms),
     lin("mix", "Mix", 0.0, 100.0, 100.0, Unit::Percent),
+    toggle("key_input", "Key Input", false),
 ];
 
 pub static COMP_INFO: PluginInfo = PluginInfo {
@@ -68,6 +69,7 @@ pub struct Compressor {
     mix: Smoother,
     lookahead: usize,
     gr_meter: f32,
+    key_input: bool,
 }
 
 impl Default for Compressor {
@@ -90,6 +92,7 @@ impl Compressor {
             mix: Smoother::new(1.0),
             lookahead: 0,
             gr_meter: 0.0,
+            key_input: false,
         };
         c.update();
         c
@@ -111,6 +114,7 @@ impl Compressor {
         }
         let max = self.delay.first().map(|d| d.max_delay() as usize).unwrap_or(0);
         self.lookahead = (ms_to_samples(self.p.v(9), sr).round() as usize).min(max);
+        self.key_input = self.p.on(11); // key_input param
     }
 
     /// Processes one frame of gain computation from a sidechain level (linear).
@@ -118,6 +122,18 @@ impl Compressor {
     fn gain_for(&mut self, level: f32) -> f32 {
         let ratio = if self.limiting() { 1000.0 } else { self.p.v(1) };
         let target = compress_gr(gain_to_db(level), self.p.v(0), ratio, self.p.v(4));
+        self.gr = ballistic(self.gr, target, self.att, self.rel);
+        if !self.gr.is_finite() {
+            self.gr = 0.0;
+        }
+        self.gr
+    }
+
+    /// Process with key input - when sidechain is enabled, use the provided key level instead of signal level
+    #[inline]
+    fn gain_for_key(&mut self, key_level: f32) -> f32 {
+        let ratio = if self.limiting() { 1000.0 } else { self.p.v(1) };
+        let target = compress_gr(gain_to_db(key_level), self.p.v(0), ratio, self.p.v(4));
         self.gr = ballistic(self.gr, target, self.att, self.rel);
         if !self.gr.is_finite() {
             self.gr = 0.0;

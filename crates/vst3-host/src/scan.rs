@@ -69,8 +69,11 @@ pub fn os_search_paths(os: Os, home: Option<PathBuf>, common_program_files: Opti
         Os::Unix => {
             if let Some(h) = home {
                 v.push(h.join(".vst3"));
+                // yabridge links the bridged Windows plugins here (`yabridgectl sync`).
+                v.push(h.join(".vst3").join("yabridge"));
             }
             v.push(PathBuf::from("/usr/lib/vst3"));
+            v.push(PathBuf::from("/usr/lib/vst3/yabridge"));
             v.push(PathBuf::from("/usr/local/lib/vst3"));
         }
     }
@@ -299,7 +302,17 @@ mod tests {
         assert_eq!(win[0], PathBuf::from("C:/CPF").join("VST3"));
         assert_eq!(win.len(), 2);
         let unix = os_search_paths(Os::Unix, Some("/home/u".into()), None, None);
-        assert_eq!(unix, vec![PathBuf::from("/home/u/.vst3"), PathBuf::from("/usr/lib/vst3"), PathBuf::from("/usr/local/lib/vst3")]);
+        // The standard folders plus the ones `yabridgectl sync` writes the bridged plugins into.
+        assert_eq!(
+            unix,
+            vec![
+                PathBuf::from("/home/u/.vst3"),
+                PathBuf::from("/home/u/.vst3/yabridge"),
+                PathBuf::from("/usr/lib/vst3"),
+                PathBuf::from("/usr/lib/vst3/yabridge"),
+                PathBuf::from("/usr/local/lib/vst3"),
+            ]
+        );
         assert!(!default_search_paths().is_empty());
     }
 

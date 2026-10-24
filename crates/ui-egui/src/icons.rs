@@ -1,7 +1,7 @@
 //! Icons drawn procedurally with the egui painter. Original SoundCraft artwork (MIT OR Apache-2.0);
 //! no image files and nothing derived from any other product's icons.
 
-use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, pos2, vec2};
+use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, pos2, vec2};
 
 fn p(r: Rect, x: f32, y: f32) -> Pos2 {
     pos2(r.min.x + r.width() * x, r.min.y + r.height() * y)
@@ -171,8 +171,76 @@ pub fn draw(painter: &Painter, r: Rect, name: &str, c: Color32) {
                 painter.line_segment([p(r, x, 0.5 - h), p(r, x, 0.5 + h)], s);
             }
         }
+        "sampler" | "kontakt" => {
+            let body = Rect::from_min_max(p(r, 0.15, 0.25), p(r, 0.85, 0.75));
+            painter.rect_stroke(body, 1.5, s, egui::StrokeKind::Middle);
+            painter.line_segment([p(r, 0.38, 0.25), p(r, 0.38, 0.75)], s);
+            painter.line_segment([p(r, 0.62, 0.25), p(r, 0.62, 0.75)], s);
+            painter.rect_filled(Rect::from_min_max(p(r, 0.32, 0.25), p(r, 0.44, 0.55)), 0.5, c);
+            painter.rect_filled(Rect::from_min_max(p(r, 0.56, 0.25), p(r, 0.68, 0.55)), 0.5, c);
+        }
+        "synth" => {
+            painter.add(Shape::line(
+                vec![p(r, 0.15, 0.7), p(r, 0.45, 0.3), p(r, 0.45, 0.7), p(r, 0.65, 0.7), p(r, 0.65, 0.3), p(r, 0.85, 0.3), p(r, 0.85, 0.7)],
+                s,
+            ));
+        }
+        "drum" => {
+            let drum = Rect::from_min_max(p(r, 0.2, 0.42), p(r, 0.8, 0.78));
+            painter.rect_stroke(drum, 2.0, s, egui::StrokeKind::Middle);
+            painter.line_segment([p(r, 0.15, 0.22), p(r, 0.45, 0.44)], s);
+            painter.line_segment([p(r, 0.85, 0.22), p(r, 0.55, 0.44)], s);
+        }
+        "mic" => {
+            let capsule = Rect::from_min_max(p(r, 0.35, 0.18), p(r, 0.65, 0.58));
+            painter.rect(capsule, CornerRadius::same(5), Color32::TRANSPARENT, s, egui::StrokeKind::Middle);
+            painter.line_segment([p(r, 0.35, 0.38), p(r, 0.65, 0.38)], s);
+            painter.line_segment([p(r, 0.5, 0.58), p(r, 0.5, 0.82)], s);
+            painter.line_segment([p(r, 0.3, 0.82), p(r, 0.7, 0.82)], s);
+        }
+        "bus" => {
+            painter.line_segment([p(r, 0.2, 0.3), p(r, 0.8, 0.3)], s);
+            painter.line_segment([p(r, 0.2, 0.5), p(r, 0.8, 0.5)], s);
+            painter.line_segment([p(r, 0.2, 0.7), p(r, 0.8, 0.7)], s);
+            painter.circle_filled(p(r, 0.4, 0.3), r.width() * 0.08, c);
+            painter.circle_filled(p(r, 0.6, 0.5), r.width() * 0.08, c);
+            painter.circle_filled(p(r, 0.35, 0.7), r.width() * 0.08, c);
+        }
+        "master" => {
+            painter.add(Shape::convex_polygon(
+                vec![p(r, 0.18, 0.74), p(r, 0.18, 0.38), p(r, 0.34, 0.52), p(r, 0.5, 0.26), p(r, 0.66, 0.52), p(r, 0.82, 0.38), p(r, 0.82, 0.74)],
+                Color32::TRANSPARENT,
+                s,
+            ));
+            painter.line_segment([p(r, 0.18, 0.74), p(r, 0.82, 0.74)], s);
+        }
         _ => {
             painter.rect_stroke(r.shrink(r.width() * 0.25), 1.0, s, egui::StrokeKind::Middle);
         }
+    }
+}
+
+/// Identifies the glyph name for a track's loaded instrument or kind.
+pub fn track_icon(track: &soundcraft_model::Track) -> &'static str {
+    match track.kind {
+        soundcraft_model::TrackKind::Instrument => {
+            if let Some(ins) = &track.instrument {
+                let p = ins.plugin.to_ascii_lowercase();
+                if p.contains("sampler") || p.contains("kontakt") {
+                    "sampler"
+                } else if p.contains("drum") {
+                    "drum"
+                } else {
+                    "synth"
+                }
+            } else {
+                "sampler"
+            }
+        }
+        soundcraft_model::TrackKind::Midi => "note",
+        soundcraft_model::TrackKind::Audio => "mic",
+        soundcraft_model::TrackKind::Aux | soundcraft_model::TrackKind::Folder => "bus",
+        soundcraft_model::TrackKind::Master => "master",
+        _ => "wave",
     }
 }

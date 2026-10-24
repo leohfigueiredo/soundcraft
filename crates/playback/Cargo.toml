@@ -12,12 +12,21 @@ soundcraft-time.workspace = true
 soundcraft-audio-io.workspace = true
 soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
+soundcraft-vst3-host.workspace = true
+soundcraft-clap-host.workspace = true
 soundcraft-dsp.workspace = true
 log.workspace = true
 serde.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal.workspace = true
+
+# Realtime promotion of the audio thread (rt.rs): SCHED_FIFO through a safe wrapper, else a
+# high-priority thread through RTKit over D-Bus (pure-Rust zbus: no libdbus at build time).
+[target.'cfg(target_os = "linux")'.dependencies]
+thread-priority = "3"
+rustix = { version = "1", features = ["process", "thread"] }
+zbus = "5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 cpal = { workspace = true, features = ["wasm-bindgen"] }
@@ -26,6 +35,10 @@ cpal = { workspace = true, features = ["wasm-bindgen"] }
 # ASIO on Windows (cpal's ASIO host). Off by default: building it downloads Steinberg's ASIO SDK
 # (its own licence) and needs LLVM (libclang) for the bindings. `cargo build -p soundcraft --features asio`.
 asio = ["cpal/asio"]
+# JACK (and PipeWire through `pipewire-jack`) as a selectable audio system on Linux/BSD. Off by
+# default: building it needs the JACK development package (`jack.pc`, e.g. libjack-jackd2-dev);
+# libjack itself is loaded at runtime. `cargo build -p soundcraft --features jack`.
+jack = ["cpal/jack"]
 
 [dev-dependencies]
 serde_json.workspace = true

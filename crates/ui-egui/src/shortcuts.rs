@@ -118,6 +118,18 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
             let _ = app.run("window.toggle_mix_edit", json!({}));
             true
         }
+        Key::F7 if plain => {
+            app.ui.show_midi_keyboard = !app.ui.show_midi_keyboard;
+            true
+        }
+        Key::F8 if plain => {
+            let _ = app.run("window.vst_folders", json!({}));
+            true
+        }
+        Key::F9 if plain => {
+            let _ = app.run("window.toggle_mix_edit", json!({}));
+            true
+        }
         Key::Enter if plain => {
             let _ = app.run("markers.add", json!({}));
             true

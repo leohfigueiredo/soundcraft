@@ -42,8 +42,11 @@ pub fn os_search_paths(home: Option<PathBuf>, common_program_files: Option<PathB
     } else {
         if let Some(h) = home {
             v.push(h.join(".clap"));
+            // Bridged Windows CLAP plugins (when a bridge links them here).
+            v.push(h.join(".clap").join("yabridge"));
         }
         v.push(PathBuf::from("/usr/lib/clap"));
+        v.push(PathBuf::from("/usr/lib/clap/yabridge"));
         v.push(PathBuf::from("/usr/local/lib/clap"));
     }
     v
@@ -193,7 +196,17 @@ mod tests {
             assert_eq!(v.len(), 2);
             assert!(v[0].ends_with("CLAP") && v[1].ends_with("CLAP"));
         } else {
-            assert_eq!(v, vec![PathBuf::from("/home/u/.clap"), PathBuf::from("/usr/lib/clap"), PathBuf::from("/usr/local/lib/clap")]);
+            // The standard folders plus the bridge's.
+            assert_eq!(
+                v,
+                vec![
+                    PathBuf::from("/home/u/.clap"),
+                    PathBuf::from("/home/u/.clap/yabridge"),
+                    PathBuf::from("/usr/lib/clap"),
+                    PathBuf::from("/usr/lib/clap/yabridge"),
+                    PathBuf::from("/usr/local/lib/clap"),
+                ]
+            );
         }
         assert!(default_search_paths().len() >= v.len().saturating_sub(1));
     }

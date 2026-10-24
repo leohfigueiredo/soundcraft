@@ -1,6 +1,6 @@
 //! Third-party VST3 plugins: discovery (`engine.vst3_plugins`). Hosting itself lives in
 //! `soundcraft-vst3-host`; id lookup for the mixer commands is shared with CLAP in
-//! `cmd::clap::plugin_info`.
+//! `cmd::clap::plugin_meta`.
 
 use super::*;
 use crate::cmd;
@@ -45,6 +45,6 @@ mod tests {
         let id = "vst3:00000000000000000000000000000000";
         assert!(e.execute("mix.insert", &json!({"track": t, "plugin": id})).is_err());
         assert!(e.execute("mix.insert", &json!({"track": t, "plugin": "vst3:not-hex"})).is_err());
-        assert!(crate::cmd::clap::plugin_info(id).is_none());
+        assert!(crate::cmd::clap::plugin_meta(id).is_none());
     }
 }

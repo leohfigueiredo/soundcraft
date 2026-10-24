@@ -10,7 +10,7 @@ fn main() {
     let gain = soundcraft_vst3_host::scan_paths(&[dir.to_path_buf()]).into_iter().find(|d| d.name == "Fixture Gain").expect("fixture").id;
     let mut p = soundcraft_vst3_host::instantiate_plugin(&gain).expect("instantiate");
     // Editor windows are hosted on macOS and Windows; elsewhere the probe reports "unsupported".
-    if cfg!(any(target_os = "macos", windows)) {
+    if cfg!(any(target_os = "macos", windows, target_os = "linux")) {
         assert_eq!(p.editor_size(), Ok((320, 240)));
     } else {
         assert!(p.editor_size().is_err());

@@ -4,6 +4,10 @@ plan/
 /dist
 /corpus
 /log
+/.apex/
+/Projects/
+/tmp/
+/*.deb
 .DS_Store
 /.claude/
 /target-*/

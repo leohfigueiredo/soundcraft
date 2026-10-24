@@ -27,13 +27,19 @@
 //! Plugin editors (`IPlugView`): on macOS the view is attached to the content `NSView` of a host
 //! `NSWindow` (titled and closable, floating above the app, resized on `IPlugFrame::resizeView`);
 //! on Windows it is attached to a host `HWND` owned by the app's window (no taskbar button,
-//! closing it hides it until the link tears it down).
+//! closing it hides it until the link tears it down); on Linux it is attached to an X11 window
+//! with `kPlatformTypeX11EmbedWindowID` (a normal window-manager window, which is what bridged
+//! plugins such as a Wine-hosted Kontakt through yabridge need, and which runs under XWayland
+//! on a Wayland session). Linux is also where the view's `Linux::IRunLoop` registrations (file
+//! descriptors and timers) are served: the host implements `Linux::IRunLoop` on both its
+//! `IHostApplication` and its `IPlugFrame`, and pumps them from the main thread each UI frame.
 //! [`Plugin::open_editor`] opens it directly; [`Plugin::editor`] returns a handle usable on the
 //! main thread while the instance processes on the audio thread (VST3's own threading model:
 //! the controller and its views live on the UI thread). Parameter edits made in the editor
 //! (`IComponentHandler::performEdit`) are reported by the handle's `idle` so the host can write
-//! them into the session. Linux (X11) editor windows are not hosted yet: opening reports
-//! "unsupported".
+//! them into the session. Closing the host window (title-bar button) hides it and tears the view
+//! down on the next idle; the plugin instance, its parameters and its audio state stay alive, and
+//! reopening the editor builds a fresh view.
 //!
 //! Not hosted yet: `IMessage`/`IAttributeList` creation through the host (plugins that need it
 //! for processor ↔ controller messaging may lose those messages), sidechain (aux buses are kept
@@ -78,7 +84,7 @@ pub fn parse_id(id: &str) -> Option<[u8; 16]> {
 }
 
 /// One plugin found by a scan.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vst3Descriptor {
     /// SoundCraft id: `vst3:<class_id>`.
     pub id: String,
@@ -128,6 +134,18 @@ mod api {
     pub fn add_search_dir(dir: &Path) -> usize {
         registry::add_search_dir(dir)
     }
+    pub fn register_search_dir(dir: &Path) {
+        registry::register_search_dir(dir)
+    }
+    pub fn adopt_scan(descriptors: Vec<Vst3Descriptor>) {
+        registry::adopt_scan(descriptors)
+    }
+    pub fn extra_dirs() -> Vec<PathBuf> {
+        registry::extra_dirs()
+    }
+    pub fn bundle_path(id: &str) -> Option<std::path::PathBuf> {
+        registry::bundle_path(id)
+    }
     pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
         registry::scan_paths(dirs)
     }
@@ -137,8 +155,35 @@ mod api {
     pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
         registry::instantiate(id)
     }
+    pub fn param_count_timeline(id: &str) -> Option<(usize, usize)> {
+        registry::param_count_timeline(id, 48_000.0, 512, false)
+    }
+    pub fn bridged_plugin_dirs() -> Vec<String> {
+        ffi::bridged_plugin_dirs()
+    }
+    pub fn add_wine_dll_dirs(dirs: &[String]) {
+        ffi::add_wine_dll_dirs(dirs)
+    }
+    pub fn bundle_classes(path: &Path) -> Result<Vec<BundleClass>, Vst3Error> {
+        let b = crate::ffi::Bundle::load(path)?;
+        Ok(b.classes()
+            .into_iter()
+            .map(|c| BundleClass {
+                id: format!("{}{}", crate::ID_PREFIX, crate::ffi::hex(&c.cid)),
+                category: c.category,
+                name: c.name,
+                sub_categories: c.sub_categories,
+            })
+            .collect())
+    }
     pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         registry::plugin_info(id)
+    }
+    pub fn descriptor_info(id: &str) -> Option<&'static PluginInfo> {
+        registry::descriptor_info(id)
+    }
+    pub fn cached_plugin_info(id: &str) -> Option<&'static PluginInfo> {
+        registry::cached_plugin_info(id)
     }
     pub fn shutdown() {
         ffi::exit_modules();
@@ -161,6 +206,14 @@ mod api {
     pub fn add_search_dir(_dir: &Path) -> usize {
         0
     }
+    pub fn register_search_dir(_dir: &Path) {}
+    pub fn adopt_scan(_descriptors: Vec<Vst3Descriptor>) {}
+    pub fn extra_dirs() -> Vec<PathBuf> {
+        Vec::new()
+    }
+    pub fn bundle_path(_id: &str) -> Option<std::path::PathBuf> {
+        None
+    }
     pub fn scan_paths(_dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
         Vec::new()
     }
@@ -170,7 +223,23 @@ mod api {
     pub fn instantiate(_id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
         Err(Vst3Error::Unsupported)
     }
+    pub fn bundle_classes(_path: &Path) -> Result<Vec<BundleClass>, Vst3Error> {
+        Err(Vst3Error::Unsupported)
+    }
+    pub fn param_count_timeline(_id: &str) -> Option<(usize, usize)> {
+        None
+    }
+    pub fn bridged_plugin_dirs() -> Vec<String> {
+        Vec::new()
+    }
+    pub fn add_wine_dll_dirs(_dirs: &[String]) {}
     pub fn plugin_info(_id: &str) -> Option<&'static PluginInfo> {
+        None
+    }
+    pub fn descriptor_info(_id: &str) -> Option<&'static PluginInfo> {
+        None
+    }
+    pub fn cached_plugin_info(_id: &str) -> Option<&'static PluginInfo> {
         None
     }
     pub fn shutdown() {}
@@ -183,6 +252,41 @@ pub fn scan() -> Vec<Vst3Descriptor> {
     api::scan()
 }
 
+/// Every class a plugin binary's factory exposes, for diagnostics: a bundle often holds more than
+/// the one instrument or effect the editor lists (separate controllers, helper classes), and a
+/// class id that looks right but is not the plugin explains a plugin that loads and does nothing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BundleClass {
+    /// `vst3:<class id hex>`.
+    pub id: String,
+    pub category: String,
+    pub name: String,
+    /// The `|`-separated sub-categories as the module reports them.
+    pub sub_categories: String,
+}
+
+/// Folders bridged (yabridge/Wine) plugins import DLLs from: the Windows side each mirror links
+/// to. `add_wine_dll_dirs` puts them on `WINEPATH`, Wine's DLL search path.
+pub fn bridged_plugin_dirs() -> Vec<String> {
+    api::bridged_plugin_dirs()
+}
+
+/// Adds folders to `WINEPATH` (Wine's DLL search path). Call once, before any thread starts.
+pub fn add_wine_dll_dirs(dirs: &[String]) {
+    api::add_wine_dll_dirs(dirs)
+}
+
+/// Parameters reported before and after the component is configured (diagnostics: a plugin that
+/// builds its parameter list on activation reports nothing before).
+pub fn param_count_timeline(id: &str) -> Option<(usize, usize)> {
+    api::param_count_timeline(id)
+}
+
+/// The classes of one bundle (diagnostics; loads the binary).
+pub fn bundle_classes(path: &Path) -> Result<Vec<BundleClass>, Vst3Error> {
+    api::bundle_classes(path)
+}
+
 /// Forgets the cached scan (and remembered failures) and scans again.
 pub fn rescan() -> Vec<Vst3Descriptor> {
     api::rescan()
@@ -192,6 +296,28 @@ pub fn rescan() -> Vec<Vst3Descriptor> {
 /// plugins the folder holds.
 pub fn add_search_dir(dir: &Path) -> usize {
     api::add_search_dir(dir)
+}
+
+/// Registers a search folder without scanning it (the next [`rescan`] picks it up). Cheap enough
+/// for the UI thread; a scan walks the folder and loads every plugin, which belongs on a worker.
+pub fn register_search_dir(dir: &Path) {
+    api::register_search_dir(dir)
+}
+
+/// Replaces the catalogue with a scan made elsewhere (see `soundcraft --scan-plugins`). The
+/// descriptors carry the bundle paths, so `instantiate` loads them in-process on demand.
+pub fn adopt_scan(descriptors: Vec<Vst3Descriptor>) {
+    api::adopt_scan(descriptors)
+}
+
+/// The folders registered for scanning (the standard ones are not included).
+pub fn extra_dirs() -> Vec<PathBuf> {
+    api::extra_dirs()
+}
+
+/// The bundle a plugin id lives in, from the catalogue (no plugin code is loaded).
+pub fn bundle_path(id: &str) -> Option<std::path::PathBuf> {
+    api::bundle_path(id)
 }
 
 /// Scans the given folders without touching the cache.
@@ -249,9 +375,44 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
     api::plugin_info(id)
 }
 
+/// A plugin's catalogue entry without loading it: the id, the name, the kind and the category,
+/// with no parameters (a hosted plugin keeps those in its own state). This is what an insert or
+/// an instrument command needs, so it must never instantiate the plugin.
+pub fn descriptor_info(id: &str) -> Option<&'static PluginInfo> {
+    api::descriptor_info(id)
+}
+
+/// What this process already knows about a plugin **without loading anything**: its parameters once
+/// one has been instantiated, otherwise [`descriptor_info`]'s entry. Use this on any per-frame UI
+/// path; [`plugin_info`] loads the module (seconds under Wine for a bridged plugin) to read them.
+pub fn cached_plugin_info(id: &str) -> Option<&'static PluginInfo> {
+    api::cached_plugin_info(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_descriptor_round_trips_through_the_scanner_protocol() {
+        // What `soundcraft --scan-plugins` prints and the editor adopts back.
+        let d = Vst3Descriptor {
+            id: "vst3:ABCD".to_string(),
+            class_id: "ABCD".to_string(),
+            name: "Test Synth".to_string(),
+            vendor: "A Vendor".to_string(),
+            version: "1.2.3".to_string(),
+            sdk_version: "VST 3.7.4".to_string(),
+            sub_categories: vec!["Instrument".to_string(), "Synth".to_string()],
+            category: soundcraft_dsp::Category::Instrument,
+            is_instrument: true,
+            path: std::path::PathBuf::from("/some/Test Synth.vst3"),
+        };
+        let json = serde_json::to_string(&serde_json::json!({"vst3": d.clone()})).expect("serialise");
+        let line: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let back: Vst3Descriptor = serde_json::from_value(line["vst3"].clone()).expect("deserialise");
+        assert_eq!(back, d);
+    }
 
     #[test]
     fn ids_parse() {

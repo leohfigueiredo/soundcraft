@@ -25,8 +25,17 @@ pub fn specs() -> Vec<CommandSpec> {
     )]
 }
 
-/// A built-in plugin's description, else a hosted CLAP (`clap:<id>`), VST3 (`vst3:<class id>`) or
-/// Audio Units (`au:<type>:<subtype>:<manufacturer>`) plugin's.
+/// The same lookup for commands that only need the id, the name and the kind: a hosted plugin
+/// answers from the scanned catalogue, so inserting one never loads its binary. Loading a bridged
+/// Windows plugin means starting Wine (seconds), and a plugin that hangs there would freeze the
+/// interface — the audio side loads it only after a child process proved it works.
+pub fn plugin_meta(id: &str) -> Option<&'static PluginInfo> {
+    soundcraft_dsp::plugin_info(id)
+        .or_else(|| soundcraft_clap_host::descriptor_info(id))
+        .or_else(|| soundcraft_vst3_host::descriptor_info(id))
+        .or_else(|| soundcraft_au_host::plugin_info(id))
+}
+
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
     soundcraft_dsp::plugin_info(id)
         .or_else(|| soundcraft_clap_host::plugin_info(id))
@@ -53,8 +62,8 @@ mod tests {
         let t = e.session().tracks[0].id.0;
         let r = e.execute("mix.insert", &json!({"track": t, "plugin": "clap:no.such.plugin"}));
         assert!(r.is_err());
-        assert!(super::plugin_info("eq_7band").is_some());
-        assert!(super::plugin_info("clap:no.such.plugin").is_none());
+        assert!(super::plugin_meta("eq_7band").is_some());
+        assert!(super::plugin_meta("clap:no.such.plugin").is_none());
     }
 
     /// Apple's own Audio Units ship with every Mac, so `mix.insert` can be checked against one.

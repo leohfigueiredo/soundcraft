@@ -45,6 +45,11 @@ pub fn separate_closed(app: &mut SoundApp) {
 
 pub(crate) fn content(app: &mut SoundApp, ui: &mut Ui) {
     let ids: Vec<TrackId> = app.engine.session().tracks.iter().filter(|x| !x.hidden && x.kind != TrackKind::Video).map(|x| x.id).collect();
+    if ids.is_empty() {
+        render_empty_mixer_view(app, ui);
+        return;
+    }
+
     // Per-channel peaks for multichannel meters (read once per frame).
     let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
     egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
@@ -53,11 +58,113 @@ pub(crate) fn content(app: &mut SoundApp, ui: &mut Ui) {
             for id in ids {
                 strip(app, ui, id, snap.as_ref());
             }
+
+            // Dedicated button to append track at the end of strips
+            let t = Tokens::current();
+            let add_strip_rect = Rect::from_min_size(ui.cursor().min, vec2(50.0, ui.available_height().max(560.0)));
+            let add_resp = ui.interact(add_strip_rect, ui.id().with("add_track_strip_btn"), Sense::click());
+            let add_hovered = add_resp.hovered();
+            ui.painter().rect_filled(add_strip_rect, 0.0, if add_hovered { Color32::from_rgb(32, 36, 44) } else { Color32::from_rgb(20, 22, 28) });
+            ui.painter().rect_stroke(add_strip_rect, 0.0, Stroke::new(1.0, Color32::from_rgb(36, 40, 50)), StrokeKind::Inside);
+            let label = if add_hovered { Color32::WHITE } else { t.accent };
+            ui.painter().text(add_strip_rect.center(), Align2::CENTER_CENTER, "➕\n\nA\nD\nD", bold(11.0), label);
+            if add_resp.on_hover_text("New track (Ctrl+Shift+N)").clicked() {
+                let _ = app.dialogs.open_for_command(&app.engine, "track.new");
+            }
+            ui.advance_cursor_after_rect(add_strip_rect);
+
             let rest = Rect::from_min_max(pos2(ui.cursor().min.x, ui.clip_rect().min.y), ui.clip_rect().max);
             if rest.width() > 4.0 && ui.interact(rest, ui.id().with("past_strips"), Sense::click()).double_clicked() {
                 let _ = app.dialogs.open_for_command(&app.engine, "track.new");
             }
         });
+    });
+}
+
+fn render_empty_mixer_view(app: &mut SoundApp, ui: &mut Ui) {
+    let t = Tokens::current();
+    let r = ui.available_rect_before_wrap();
+
+    // Studio dark console backdrop
+    ui.painter().rect_filled(r, 0.0, Color32::from_rgb(18, 20, 25));
+
+    // Centered card
+    let card_w = 640.0f32.min((r.width() - 40.0).max(300.0));
+    let card_h = 360.0f32.min((r.height() - 40.0).max(260.0));
+    let card_rect = Rect::from_center_size(r.center(), vec2(card_w, card_h));
+
+    ui.painter().rect_filled(card_rect, 8.0, Color32::from_rgb(26, 28, 36));
+    ui.painter().rect_stroke(card_rect, 8.0, Stroke::new(1.0, Color32::from_rgb(48, 52, 66)), StrokeKind::Inside);
+
+    // Header accent line
+    ui.painter().line_segment(
+        [pos2(card_rect.min.x + 8.0, card_rect.min.y + 4.0), pos2(card_rect.max.x - 8.0, card_rect.min.y + 4.0)],
+        Stroke::new(2.0, t.accent),
+    );
+
+    let inner_rect = card_rect.shrink2(vec2(24.0, 20.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect).layout(egui::Layout::top_down(egui::Align::Center)));
+    let ui = &mut child;
+
+    ui.label(egui::RichText::new("🎛️ MIX CONSOLE").font(bold(18.0)).color(t.accent));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("This session has no audio or instrument tracks yet.").font(regular(12.5)).color(t.text_dim));
+    let hint = egui::RichText::new("Pick one of the options below to create faders and pan knobs:");
+    ui.label(hint.font(regular(11.5)).color(Color32::from_rgb(170, 175, 190)));
+
+    ui.add_space(18.0);
+
+    let btn_h = 34.0;
+    let btn_w = (card_w - 60.0).clamp(240.0, 460.0);
+
+    // 1. Instrument Track
+    let inst_btn = egui::Button::new(egui::RichText::new("🎹  New Instrument Track (Kontakt / Synth)").font(bold(12.5)).color(Color32::WHITE))
+        .min_size(vec2(btn_w, btn_h))
+        .fill(Color32::from_rgb(30, 95, 140));
+    let inst_hint = "Creates a stereo instrument track with fader, pan and a slot for Kontakt 7/8, Omnisphere or a built-in synth";
+    if ui.add(inst_btn).on_hover_text(inst_hint).clicked() {
+        let _ = app.run("track.new", json!({"kind": "instrument", "format": "stereo", "name": "Kontakt Inst"}));
+    }
+
+    ui.add_space(8.0);
+
+    // 2. Audio Track
+    let audio_btn = egui::Button::new(egui::RichText::new("🎙️  New Audio Track (Stereo)").font(bold(12.5)).color(Color32::WHITE))
+        .min_size(vec2(btn_w, btn_h))
+        .fill(Color32::from_rgb(40, 110, 80));
+    if ui.add(audio_btn).on_hover_text("Creates a stereo audio track with volume fader, pan and VST3/CLAP insert slots").clicked() {
+        let _ = app.run("track.new", json!({"kind": "audio", "format": "stereo", "name": "Audio 1"}));
+    }
+
+    ui.add_space(8.0);
+
+    // 3. Master Fader
+    let master_btn = egui::Button::new(egui::RichText::new("👑  Create Master Fader (Main Output)").font(bold(12.5)).color(Color32::WHITE))
+        .min_size(vec2(btn_w, btn_h))
+        .fill(Color32::from_rgb(120, 75, 25));
+    if ui.add(master_btn).on_hover_text("Creates the master fader channel with peak/RMS meters and stereo output control").clicked() {
+        let _ = app.run("track.new", json!({"kind": "master", "format": "stereo", "name": "Master"}));
+    }
+
+    ui.add_space(8.0);
+
+    // 4. Load Demo Session
+    let demo_btn = egui::Button::new(egui::RichText::new("📂  Load the Full Demo Session").font(bold(12.0)).color(Color32::WHITE))
+        .min_size(vec2(btn_w, 30.0))
+        .fill(Color32::from_rgb(50, 54, 68));
+    if ui.add(demo_btn).on_hover_text("Opens the full demo session: drums, bass, synths and a mixed arrangement").clicked() {
+        let _ = app.run("session.new", json!({"template": "demo"}));
+    }
+
+    ui.add_space(12.0);
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Or use").small().color(t.text_dim));
+        let new_dlg = ui.link(egui::RichText::new("Ctrl+Shift+N").small().strong().color(t.accent));
+        if new_dlg.on_hover_text("Opens the new-tracks dialog for custom counts, kinds and formats").clicked() {
+            let _ = app.dialogs.open_for_command(&app.engine, "track.new");
+        }
+        ui.label(egui::RichText::new("to choose count, kind and channel format.").small().color(t.text_dim));
     });
 }
 
@@ -229,6 +336,23 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 5.0 * 17.0));
         inset(ui.painter(), sec, t.strip_section);
         section_label(ui, sec, title, narrow);
+        if !is_send && off == 0 {
+            let fx_r = Rect::from_min_size(pos2(sec.max.x - 24.0, sec.min.y + 1.0), vec2(22.0, 13.0));
+            let fx_resp = ui.interact(fx_r, ui.id().with(("mix_fx_btn", id.0)), Sense::click());
+            let has_fx = track.instrument.is_some() || track.mixer.inserts.iter().any(Option::is_some);
+            let (fx_bg, fx_fg) = if has_fx {
+                (Color32::from_rgb(0, 210, 120), Color32::from_rgb(10, 30, 20))
+            } else if fx_resp.hovered() {
+                (t.button_hi, t.text)
+            } else {
+                (t.button, t.text_dim)
+            };
+            ui.painter().rect_filled(fx_r, 2.0, fx_bg);
+            ui.painter().text(fx_r.center(), Align2::CENTER_CENTER, "FX", bold(8.5), fx_fg);
+            if fx_resp.on_hover_text("Open Track FX Browser & Chain Window").clicked() {
+                app.ui.show_fx_browser = Some(id);
+            }
+        }
         for k in 0..5 {
             let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0 + k as f32 * 17.0), vec2(inner_w - 4.0, 15.0));
             if is_send {
@@ -397,8 +521,17 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     );
     row.spacing_mut().item_spacing.x = 6.0;
     if track.kind != TrackKind::Master {
-        if text_toggle(&mut row, vec2(bw, 18.0), "S", track.mixer.solo, t.solo, "Solo").clicked() {
-            let _ = app.run("mix.solo", json!({"track": id.0}));
+        if text_toggle(&mut row, vec2(bw, 18.0), "S", track.mixer.solo, t.solo, "Solo (Alt-click clears all)").clicked() {
+            if ui.input(|i| i.modifiers.alt) {
+                let _ = app.run("mix.clear_solos", json!({}));
+            } else {
+                let cur = track.mixer.solo;
+                let _ = app.run("mix.solo", json!({"track": id.0}));
+                if !cur {
+                    let _ = app.run("edit.select", json!({"track": id.0}));
+                    let _ = app.run("window.console.track", json!({}));
+                }
+            }
         }
         if text_toggle(&mut row, vec2(bw, 18.0), "M", track.mixer.mute, t.mute, "Mute").clicked() {
             let _ = app.run("mix.mute", json!({"track": id.0}));
@@ -465,15 +598,54 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         TrackKind::Video => "video",
     };
     ui.painter().text(pos2(vr.center().x, vr.max.y + 9.0), Align2::CENTER_CENTER, kind, regular(9.5), t.text_dim);
-    let nr = Rect::from_min_size(pos2(x0, r.max.y - 26.0), vec2(inner_w, 18.0));
+
+    let is_target = crate::virtual_keyboard::active_target_track(app) == Some(id);
+    let msc_channel = (0..app.msc.config.channels).find(|&ch| app.msc.track_for_channel(app.engine.session(), ch) == Some(id));
+
+    if is_target || selected {
+        let border_color = if is_target { t.accent } else { t.selection };
+        ui.painter().rect_stroke(r.shrink(1.0), 2.0, Stroke::new(2.0, border_color), StrokeKind::Inside);
+    }
+
+    if let Some(ch) = msc_channel {
+        let badge_r = Rect::from_min_size(pos2(x0, r.max.y - 42.0), vec2(inner_w, 13.0));
+        ui.painter().rect_filled(badge_r, 2.0, t.accent_dark);
+        ui.painter().text(badge_r.center(), Align2::CENTER_CENTER, format!("MSC CH {}", ch + 1), bold(9.0), Color32::WHITE);
+    } else if is_target {
+        let badge_r = Rect::from_min_size(pos2(x0, r.max.y - 42.0), vec2(inner_w, 13.0));
+        ui.painter().rect_filled(badge_r, 2.0, t.accent_dark);
+        ui.painter().text(badge_r.center(), Align2::CENTER_CENTER, "ACTIVE", bold(8.5), Color32::WHITE);
+    }
+
+    let nr = Rect::from_min_size(pos2(x0, r.max.y - 26.0), vec2(inner_w, 20.0));
+    let track_col = rgb(track.color);
+    let lum = (track.color[0] as f32 * 0.299 + track.color[1] as f32 * 0.587 + track.color[2] as f32 * 0.114) / 255.0;
+    let fill_col = if lum > 0.05 { track_col } else { if selected { t.name_field_sel } else { t.name_field } };
+    let is_dark_bg = (track.color[0] as f32 * 0.299 + track.color[1] as f32 * 0.587 + track.color[2] as f32 * 0.114) < 140.0;
+    let text_col = if is_dark_bg { Color32::WHITE } else { Color32::from_rgb(15, 18, 22) };
+
     ui.painter().rect(
         nr,
-        CornerRadius::same(2),
-        if selected { t.name_field_sel } else { t.name_field },
-        Stroke::new(1.0, Color32::BLACK),
+        CornerRadius::same(3),
+        fill_col,
+        Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { Color32::WHITE } else { Color32::BLACK }),
         StrokeKind::Inside,
     );
-    ui.painter().with_clip_rect(nr).text(nr.center(), Align2::CENTER_CENTER, &track.name, bold(12.0), t.text_dark);
+
+    // FL Studio Track Number badge (e.g. "M" for Master, "1", "2", "3"...)
+    let track_idx = session.tracks.iter().filter(|t| !t.hidden && t.kind != TrackKind::Video).position(|t| t.id == id);
+    let track_num_str = if track.kind == TrackKind::Master { "M".to_string() } else { format!("{}", track_idx.map_or(1, |i| i + 1)) };
+    let num_r = Rect::from_min_size(pos2(nr.min.x + 2.5, nr.min.y + 2.5), vec2(15.0, 15.0));
+    ui.painter().rect_filled(num_r, 2.0, if is_dark_bg { Color32::from_black_alpha(90) } else { Color32::from_white_alpha(120) });
+    ui.painter().text(num_r.center(), Align2::CENTER_CENTER, &track_num_str, bold(9.5), text_col);
+
+    // Track Glyph Icon slot (Kontakt/Sampler, Synth, Drum, Mic, Bus, Master)
+    let icon_name = crate::icons::track_icon(track);
+    let icon_r = Rect::from_min_size(pos2(nr.min.x + 20.0, nr.min.y + 3.0), vec2(14.0, 14.0));
+    crate::icons::draw(ui.painter(), icon_r, icon_name, text_col);
+
+    let text_r = Rect::from_min_max(pos2(nr.min.x + 36.0, nr.min.y), nr.max);
+    ui.painter().with_clip_rect(text_r).text(pos2(text_r.min.x + 2.0, text_r.center().y), Align2::LEFT_CENTER, &track.name, bold(11.5), text_col);
     let nresp = ui.interact(nr, ui.id().with(("strip_name", id.0)), Sense::click());
     if nresp.clicked() {
         crate::edit_window::click_track(app, id, ui.input(|i| i.modifiers), |_, t| !t.hidden && t.kind != TrackKind::Video);
@@ -488,6 +660,34 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     ui.painter().line_segment([pos2(r.max.x, r.min.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, t.border));
 }
 
+/// Opens a plugin's own (native, detached) window: what the FL-style "GUI" button and a
+/// double-click on a plugin name do. Failures land in the status bar, never in a panic.
+pub(crate) fn open_native_gui(app: &mut SoundApp, id: TrackId, slot: usize) {
+    if let Some(p) = app.player.as_ref() {
+        match p.open_editor(id, slot) {
+            Ok(()) => {
+                log::info!("plugin window opened: track {} slot {slot}", id.0);
+                app.pending_gui = None;
+            }
+            Err(e) => {
+                let unav = p.plugin_load_status();
+                let has_plugin = app.engine.session().track(id).is_some_and(|t| {
+                    (slot == soundcraft_mix::INSTRUMENT_SLOT && t.instrument.is_some()) || (slot < t.mixer.inserts.len() && t.mixer.inserts[slot].is_some())
+                });
+                let is_refused = unav.iter().any(|(t, s, _, st)| *t == id && *s == slot && *st == soundcraft_playback::ProbeState::Refused);
+                if has_plugin && !is_refused {
+                    app.pending_gui = Some((id, slot));
+                    app.ui.status = "Loading plugin editor in Wine / yabridge; window will open automatically...".to_string();
+                } else {
+                    app.pending_gui = None;
+                    log::warn!("plugin window for track {} slot {slot} did not open: {e}", id.0);
+                    app.ui.status = format!("Plugin window: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// An instrument track's INSTRUMENT row: click opens a hosted instrument's plugin window,
 /// right-click (or click, when none is set) picks another instrument. A built-in's parameters
 /// open from that menu. Dropping an audio file on it loads the sampler.
@@ -496,17 +696,59 @@ pub(crate) fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r:
     let (id, slot) = (track.id, soundcraft_mix::INSTRUMENT_SLOT);
     let ins = track.instrument.as_ref();
     let info = ins.and_then(|i| plugin_info(&i.plugin));
-    let resp = ui.interact(r, ui.id().with(("instrument", id.0)), Sense::click());
+    // The dedicated GUI button sits at the right of a used row, so a click on it never opens
+    // the parameter window instead.
+    // The window button is shown whenever a plugin is loaded, even before its parameter table
+    // has been fetched: opening the user interface must never depend on that.
+    // Next to it, ALT opens this instrument's alternative console — only for the hosted plugins
+    // that have one, so the row never shows a button that does nothing.
+    let console = ins.and_then(|i| crate::console_kit::profile_for_plugin(&i.plugin));
+    let alt_w = if console.is_some() { 24.0 } else { 0.0 };
+    let gui_w = if ins.is_some() { 26.0 } else { 0.0 } + alt_w;
+    let body = Rect::from_min_max(r.min, pos2(r.max.x - gui_w, r.max.y));
+    let resp = ui.interact(body, ui.id().with(("instrument", id.0)), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Instrument"));
     match info {
         Some(info) => used_slot(ui.painter(), r, t.slot_face, Mark::Dot, info.short_name, t.text, None),
+        None if ins.is_some() => {
+            let name = ins.as_ref().map(|i| i.plugin.trim_start_matches("vst3:").trim_start_matches("clap:")).unwrap_or("Plugin");
+            used_slot(ui.painter(), r, t.slot_face, Mark::Dot, &name[..name.len().min(10)], t.text, None)
+        }
         None => empty_slot(ui.painter(), r, resp.hovered(), Mark::Dot),
     }
     let hosted = ins.is_some_and(|i| soundcraft_mix::is_third_party(&i.plugin));
-    if resp.clicked() && hosted && !app.ui.plugin_windows.contains(&(id, slot)) {
-        app.ui.plugin_windows.push((id, slot));
+    if let Some(profile) = console {
+        // ALT: the alternative console for this very VST, on this very track.
+        let alt_r = Rect::from_min_max(pos2(r.max.x - gui_w + 1.0, r.min.y + 2.0), pos2(r.max.x - alt_w - 1.0, r.max.y - 2.0));
+        let alt_resp = ui.interact(alt_r, ui.id().with(("instrument_alt", id.0)), Sense::click());
+        alt_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Alt GUI"));
+        let (bg, fg) = if alt_resp.hovered() { (t.accent, t.text_dark) } else { (t.button, t.text) };
+        ui.painter().rect_filled(alt_r, 2.0, bg);
+        ui.painter().text(alt_r.center(), Align2::CENTER_CENTER, "ALT", bold(8.0), fg);
+        if alt_resp.on_hover_text(format!("Open the alternative GUI for {} (choose the instrument there)", profile.name)).clicked() {
+            crate::console_kit::open_for_track(app, id);
+        }
     }
-    let menu_resp = if hosted { resp.clone().on_hover_text("Click: open instrument · right-click: change") } else { resp.clone() };
+    if ins.is_some() {
+        let gui_r = Rect::from_min_max(pos2(r.max.x - 26.0 + 1.0, r.min.y + 2.0), pos2(r.max.x - 1.0, r.max.y - 2.0));
+        let gui_resp = ui.interact(gui_r, ui.id().with(("instrument_gui", id.0)), Sense::click());
+        let (bg, fg) = if gui_resp.hovered() { (t.accent, t.text_dark) } else { (t.button, t.text) };
+        ui.painter().rect_filled(gui_r, 2.0, bg);
+        ui.painter().text(gui_r.center(), Align2::CENTER_CENTER, "GUI", bold(8.0), fg);
+        if gui_resp.on_hover_text("Open the plugin's own window").clicked() {
+            open_native_gui(app, id, slot);
+        }
+    }
+    if hosted && (resp.double_clicked() || (resp.clicked() && !app.ui.plugin_windows.contains(&(id, slot)))) {
+        // Double-click opens the native plugin window; a single click the parameter window.
+        if resp.double_clicked() {
+            open_native_gui(app, id, slot);
+        } else {
+            app.ui.plugin_windows.push((id, slot));
+        }
+    }
+    let tip = "Click: parameters · double-click: plugin window · right-click: change";
+    let menu_resp = if hosted { resp.clone().on_hover_text(tip) } else { resp.clone() };
     let popup = if hosted { egui::Popup::context_menu(&menu_resp) } else { egui::Popup::menu(&menu_resp) };
     let popup = popup.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
     popup.show(|ui| instrument_menu(app, ui, id));
@@ -606,8 +848,12 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
             app.ui.plugin_windows.push((id, slot));
         }
     }
+    if ins.is_some() && resp.double_clicked() {
+        // Double-click: the plugin's own window (a native, detached one for bridged plugins).
+        open_native_gui(app, id, slot);
+    }
     let cmd = if ui.ctx().os().is_mac() { "⌘" } else { "Ctrl+" };
-    let tip = format!("{name}: click to open · {cmd}click to bypass · right-click to change");
+    let tip = format!("{name}: click for parameters · double-click for the plugin window · {cmd}click to bypass · right-click to change");
     let menu_resp = if ins.is_none() { resp.clone() } else { resp.clone().on_hover_text(tip) };
     let popup = if ins.is_none() { egui::Popup::menu(&menu_resp) } else { egui::Popup::context_menu(&menu_resp) };
     let popup = popup.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
@@ -630,6 +876,32 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         }
         if ui.button("no insert").clicked() {
             run_pick(app, ui, "mix.insert_remove", json!({"track": id.0, "slot": slot}));
+        }
+        // MIDI Learn: bind a hardware knob/fader to one of this plugin's parameters.
+        let learn_params: Option<&'static [soundcraft_dsp::ParamInfo]> = app
+            .engine
+            .session()
+            .track(id)
+            .and_then(|t| t.mixer.inserts.get(slot).cloned().flatten())
+            .and_then(|i| plugin_info(&i.plugin))
+            .map(|info| info.params);
+        if let Some(params) = learn_params.filter(|p| !p.is_empty()) {
+            ui.menu_button("MIDI Learn…", |ui| {
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for param in params.iter().take(96) {
+                        if ui.button(format!("{} ({})", param.name, param.id)).clicked() {
+                            app.msc.learn_start(crate::msc_mixer::LearnTarget::InsertParam {
+                                track: id.0,
+                                slot: slot as u32,
+                                param: param.id.to_string(),
+                                min: param.min,
+                                max: param.max,
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+            });
         }
         ui.separator();
     }
@@ -674,6 +946,24 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
             }
             ui.close();
         }
+        // MIDI Learn: bind a hardware knob/fader to one of the instrument's parameters.
+        if !info.params.is_empty() {
+            ui.menu_button("MIDI Learn…", |ui| {
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for param in info.params.iter().take(96) {
+                        if ui.button(format!("{} ({})", param.name, param.id)).clicked() {
+                            app.msc.learn_start(crate::msc_mixer::LearnTarget::InstrumentParam {
+                                track: id.0,
+                                param: param.id.to_string(),
+                                min: param.min,
+                                max: param.max,
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
         if let Some(p) = &app.player
             && p.has_editor(id, slot)
         {
@@ -709,8 +999,27 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
 
 /// Runs a menu's pick, shows its error in the status line and closes the menu.
 fn run_pick(app: &mut SoundApp, ui: &Ui, cmd: &str, params: serde_json::Value) {
-    if let Err(e) = app.run(cmd, params) {
-        app.ui.status = e;
+    let third_party = params.get("plugin").and_then(|v| v.as_str()).map(soundcraft_mix::is_third_party).unwrap_or(false);
+    let track_id = params.get("track").and_then(|v| v.as_u64()).map(soundcraft_model::TrackId);
+    let slot = params.get("slot").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
+
+    match app.run(cmd, params) {
+        Ok(_) => {
+            if let Some(p) = &app.player {
+                p.update_session(app.engine.session_arc());
+            }
+            if let Some(t_id) = track_id {
+                if third_party && app.player.is_some() {
+                    app.pending_gui = Some((t_id, slot));
+                } else {
+                    // Try to open native GUI, but don't crash if it fails
+                    open_native_gui(app, t_id, slot);
+                }
+            }
+        }
+        Err(e) => {
+            app.ui.status = e;
+        }
     }
     ui.close();
 }
@@ -750,11 +1059,9 @@ fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<
     if clap.is_none() || vst3.is_none() {
         ui.separator();
         ui.horizontal(|ui| {
-            if clap.is_none() && ui.small_button("Scan CLAP").clicked() {
-                soundcraft_clap_host::scan();
-            }
-            if vst3.is_none() && ui.small_button("Scan VST3").clicked() {
-                soundcraft_vst3_host::scan();
+            // Never scan on the UI thread: a removable drive can take minutes to walk.
+            if (clap.is_none() || vst3.is_none()) && ui.small_button("Scan plugins").clicked() {
+                crate::fx_browser::spawn_async_sync(None, false);
             }
         });
     }
@@ -845,15 +1152,18 @@ struct MenuPlugin {
 /// id picked. Each format is scanned the first time its submenu opens, then cached by its host.
 fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
     let mut picked = None;
+    let scanning = crate::fx_browser::is_scanning();
     ui.menu_button("CLAP", |ui| {
-        let list = soundcraft_clap_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
-        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No CLAP plugins found") {
+        let list = soundcraft_clap_host::cached().unwrap_or_default().into_iter().filter(|d| d.is_instrument == instruments);
+        let empty_msg = if scanning { "Scanning CLAP plugins…" } else { "No CLAP plugins found" };
+        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), empty_msg) {
             picked = Some(p);
         }
     });
     ui.menu_button("VST3", |ui| {
-        let list = soundcraft_vst3_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
-        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No VST3 plugins found") {
+        let list = soundcraft_vst3_host::cached().unwrap_or_default().into_iter().filter(|d| d.is_instrument == instruments);
+        let empty_msg = if scanning { "Scanning VST3 plugins…" } else { "No VST3 plugins found" };
+        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), empty_msg) {
             picked = Some(p);
         }
     });
@@ -899,10 +1209,16 @@ fn vendor_menus(ui: &mut Ui, mut list: Vec<MenuPlugin>, none: &str) -> Option<St
 
 /// A built-in plugin's description, else a hosted CLAP (`clap:<id>`), VST3 (`vst3:<class id>`) or
 /// Audio Unit (`au:<type>:<subtype>:<manufacturer>`) plugin's.
+/// This is what the interface draws (strips, menus, titles) and it never blocks: a hosted plugin's
+/// parameters are here once an instance has been created for them to be read. Reading them the other
+/// way (`soundcraft_vst3_host::plugin_info`) instantiates the plugin — seconds for a bridged Windows
+/// plugin, a hang if Wine is stuck, and an in-process load of a plugin whose validation child has not
+/// said that is safe yet — so it never runs on a paint path. A control that needs the whole table asks
+/// [`crate::fx_browser::learn_plugin_params`] and fills itself in on a later frame.
 pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
     soundcraft_dsp::plugin_info(id)
-        .or_else(|| soundcraft_clap_host::plugin_info(id))
-        .or_else(|| soundcraft_vst3_host::plugin_info(id))
+        .or_else(|| soundcraft_clap_host::cached_plugin_info(id))
+        .or_else(|| soundcraft_vst3_host::cached_plugin_info(id))
         .or_else(|| soundcraft_au_host::plugin_info(id))
 }
 

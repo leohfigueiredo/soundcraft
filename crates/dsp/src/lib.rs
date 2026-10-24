@@ -192,6 +192,18 @@ pub struct Transport {
 /// Contract: `process` never allocates or panics. It processes `min(frames, io[c].len())` frames
 /// of at most the channel count given to `prepare`; extra channels are left untouched.
 /// Instruments replace the buffer contents with their output.
+/// A program list a hosted plugin publishes (VST3 `IUnitInfo`): the preset banks a console pins its
+/// instruments to. Built-ins have none.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProgramList {
+    /// The plugin's own list id (VST3 `ProgramListID`).
+    pub id: i32,
+    /// The list's name ("Factory", "Bass", …) as the plugin spells it.
+    pub name: String,
+    /// Program names in index order.
+    pub programs: Vec<String>,
+}
+
 pub trait Plugin: Send {
     fn info(&self) -> &'static PluginInfo;
     fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize);
@@ -218,6 +230,20 @@ pub trait Plugin: Send {
     /// Instruments: note events at sample offsets within the next block.
     fn note_on(&mut self, _offset: usize, _note: u8, _velocity: u8) {}
     fn note_off(&mut self, _offset: usize, _note: u8) {}
+    /// The preset banks the plugin publishes (VST3 `IUnitInfo`). Empty for built-ins and for
+    /// plugins that have no program lists.
+    fn program_lists(&self) -> Vec<ProgramList> {
+        Vec::new()
+    }
+    /// A handle the UI can list programs through without touching the audio side's instance.
+    fn program_reader(&mut self) -> Option<Box<dyn PluginProgramReader>> {
+        None
+    }
+    /// Selects `program` of `list` (indices into [`Plugin::program_lists`]). `false` when the
+    /// plugin cannot: it has no such program, or publishes no program-change parameter.
+    fn select_program(&mut self, _list: usize, _program: usize) -> bool {
+        false
+    }
     /// Instruments: any other MIDI 1.0 channel message (control change, pitch bend, pressure,
     /// program change) at a sample offset within the next block.
     fn midi(&mut self, _offset: usize, _msg: [u8; 3]) {}
@@ -279,9 +305,22 @@ pub trait PluginEditor: Send {
 
 /// Reads a plugin's state on the main (UI) thread while the instance processes on the audio
 /// thread, as plugin formats allow. Obtained from [`Plugin::state_reader`]; closures are readers.
+/// A handle that lists a live plugin's programs from the UI thread (the instance itself belongs to
+/// the audio side), the same pattern as [`PluginStateReader`].
+pub trait PluginProgramReader: Send {
+    /// The plugin's program lists; empty once the instance is gone.
+    fn programs(&mut self) -> Vec<ProgramList>;
+}
+
 pub trait PluginStateReader: Send {
     /// What [`Plugin::save_state`] would return; `None` once the instance is gone.
     fn save_state(&mut self) -> Option<Vec<u8>>;
+}
+
+impl<F: FnMut() -> Vec<ProgramList> + Send> PluginProgramReader for F {
+    fn programs(&mut self) -> Vec<ProgramList> {
+        self()
+    }
 }
 
 impl<F: FnMut() -> Option<Vec<u8>> + Send> PluginStateReader for F {

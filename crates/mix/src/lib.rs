@@ -215,6 +215,35 @@ struct PluginSlot {
     failed: bool,
 }
 
+/// The pitches an instrument currently has sounding: one bit per MIDI note. Fixed size, so note
+/// bookkeeping on the audio thread never allocates.
+#[derive(Clone, Copy, Default)]
+struct HeldNotes([u64; 2]);
+
+impl HeldNotes {
+    #[inline]
+    fn insert(&mut self, pitch: u8) {
+        let p = usize::from(pitch & 0x7F);
+        self.0[p / 64] |= 1 << (p % 64);
+    }
+
+    #[inline]
+    fn remove(&mut self, pitch: u8) {
+        let p = usize::from(pitch & 0x7F);
+        self.0[p / 64] &= !(1 << (p % 64));
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.0 = [0, 0];
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0 == [0, 0]
+    }
+}
+
 struct Strip {
     buf: Vec<Vec<f32>>,
     /// Pre-fader copy for pre-fader sends.
@@ -224,10 +253,16 @@ struct Strip {
     instrument: Option<PluginSlot>,
     /// The pool audio handed to the instrument with `set_sample` (sample-playing instruments).
     sample: Option<Arc<SourceAudio>>,
-    /// MIDI notes currently sounding on the instrument (pitch), for note-offs at stops/seek.
-    held: Vec<u8>,
+    /// MIDI notes currently sounding on the instrument (one bit per pitch), for note-offs at
+    /// stops/seek and for holding a live keyboard. Fixed size: the audio thread never allocates.
+    held: HeldNotes,
     /// The instrument's next block starts somewhere new: send it the controllers in effect there.
     chase: bool,
+    /// A live MIDI message was just handed to the instrument and must reach it with the next block.
+    /// Instruments are skipped while the transport is stopped and nothing is held (monitor-only),
+    /// and a note-off is exactly the case where nothing is held any more: without this flag the
+    /// release stayed in the queue and the note sounded forever.
+    live_pending: bool,
     muted: bool,
     gr: f32,
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
@@ -309,7 +344,8 @@ impl Strip {
             plugins: Vec::new(),
             instrument: None,
             sample: None,
-            held: Vec::new(),
+            held: HeldNotes::default(),
+            live_pending: false,
             chase: true,
             muted: false,
             gr: 0.0,
@@ -337,6 +373,8 @@ pub struct MixEngine {
     pub main_meter: StripMeter,
     pub pan_law: PanLaw,
     /// Last rendered position end (to detect seeks).
+    /// The last block's start (a stopped transport renders at a fixed position).
+    last_pos: Samples,
     last_end: Samples,
     /// Snapshot key of the session the strips/order were synced to.
     synced: (usize, usize, usize),
@@ -383,7 +421,9 @@ struct SlotCtx<'a> {
 
 impl SlotCtx<'_> {
     fn retire(&mut self, slot: Option<PluginSlot>) {
-        if let Some(s) = slot {
+        if let Some(mut s) = slot {
+            s.plugin.all_notes_off();
+            s.plugin.reset();
             self.retired.push(s.plugin);
         }
     }
@@ -428,6 +468,7 @@ impl MixEngine {
             meters: HashMap::new(),
             main_meter: StripMeter::default(),
             pan_law: PanLaw::Minus3,
+            last_pos: Samples::MIN,
             last_end: 0,
             synced: (0, 0, 0),
             order: Vec::new(),
@@ -520,6 +561,148 @@ impl MixEngine {
         self.main_meter = StripMeter::default();
     }
 
+    /// Whether a live MIDI message (a note-off, a controller) is still waiting for the next block.
+    /// The audio side must keep rendering while this is true, or the message never reaches the
+    /// plugin: with the transport stopped nothing else asks for a block, and a release left in the
+    /// queue is a note that never stops.
+    pub fn has_live_pending(&self) -> bool {
+        self.strips.values().any(|s| s.live_pending)
+    }
+
+    /// Whether any instrument strip currently holds live sounding notes.
+    pub fn has_live_held(&self) -> bool {
+        self.strips.values().any(|s| !s.held.is_empty())
+    }
+
+    /// Whether an enabled plugin instance should keep the realtime graph processing while stopped.
+    pub fn has_active_plugins(&self, session: &Session) -> bool {
+        self.strips.iter().any(|(id, strip)| {
+            let Some(track) = session.track(*id).filter(|track| !track.inactive) else { return false };
+            let instrument =
+                matches!(track.kind, TrackKind::Instrument | TrackKind::Midi)
+                    && track.instrument.as_ref().is_some_and(|insert| insert.active && !insert.bypass)
+                    && strip.instrument.as_ref().is_some_and(|slot| !slot.failed);
+            let insert = track.mixer.inserts.iter().enumerate().any(|(index, insert)| {
+                insert.as_ref().is_some_and(|insert| insert.active && !insert.bypass)
+                    && strip.plugins.get(index).and_then(Option::as_ref).is_some_and(|slot| !slot.failed)
+            });
+            instrument || insert
+        })
+    }
+
+    /// The preset banks a track's plugin publishes (inserts by index, [`INSTRUMENT_SLOT`] for the
+    /// instrument). Empty when that slot is empty or the plugin has no program lists.
+    pub fn plugin_programs(&mut self, track: TrackId, slot: usize) -> Vec<soundcraft_dsp::ProgramList> {
+        let Some(strip) = self.strips.get_mut(&track) else { return Vec::new() };
+        let target = if slot == INSTRUMENT_SLOT { strip.instrument.as_ref() } else { strip.plugins.get(slot).and_then(Option::as_ref) };
+        target.filter(|s| !s.failed).map(|s| s.plugin.program_lists()).unwrap_or_default()
+    }
+
+    /// Selects `program` of `list` on a track's plugin. `false` when the slot is empty, the
+    /// program is out of range, or the plugin cannot switch programs.
+    pub fn select_plugin_program(&mut self, track: TrackId, slot: usize, list: usize, program: usize) -> bool {
+        let Some(strip) = self.strips.get_mut(&track) else { return false };
+        let target = if slot == INSTRUMENT_SLOT { strip.instrument.as_mut() } else { strip.plugins.get_mut(slot).and_then(Option::as_mut) };
+        target.filter(|s| !s.failed).is_some_and(|s| s.plugin.select_program(list, program))
+    }
+
+    /// Sets one parameter of a live plugin addressed by its SoundCraft id (`"4"`, `"cutoff"`) or by
+    /// the name it shows in its own parameter list (`"Drive"`), which is what an on-screen control and
+    /// a session's automation lane carry. The value is the plain display value, clamped into the
+    /// plugin's own range.
+    ///
+    /// This is the direct route for hosts whose plugins ignore MIDI CC: no controller learning, no
+    /// channel, the parameter moves. `false` when the slot is empty or failed, or nothing in that
+    /// plugin's parameter list answers to the name.
+    pub fn set_plugin_param_by_label(&mut self, track: TrackId, slot: usize, name_or_id: &str, value: f32) -> bool {
+        if !value.is_finite() || name_or_id.is_empty() {
+            return false;
+        }
+        let Some(strip) = self.strips.get_mut(&track) else { return false };
+        let target = if slot == INSTRUMENT_SLOT { strip.instrument.as_mut() } else { strip.plugins.get_mut(slot).and_then(Option::as_mut) };
+        let Some(target) = target.filter(|s| !s.failed) else { return false };
+        let Some(id) = find_param_id(target.plugin.info(), name_or_id) else { return false };
+        // The plugin clamps into its own range (`Plugin::set_param`'s contract), which is also what a
+        // console with slightly different limits needs: never push a value the host did not publish.
+        target.plugin.set_param(id, value)
+    }
+
+    /// The live state of a track's plugin (insert by index, [`INSTRUMENT_SLOT`] for the
+    /// instrument), the same blob [`Self::plugin_programs`]' plugins are saved with.
+    pub fn capture_plugin_state(&mut self, track: TrackId, slot: usize) -> Option<Vec<u8>> {
+        let strip = self.strips.get_mut(&track)?;
+        let target = if slot == INSTRUMENT_SLOT { strip.instrument.as_mut() } else { strip.plugins.get_mut(slot).and_then(Option::as_mut) }?;
+        if target.failed {
+            return None;
+        }
+        target.plugin.save_state()
+    }
+
+    /// Restores a plugin state into the live instance: what a console's "preset" does when the
+    /// plugin cannot switch programs by itself. `false` when the slot is empty or the plugin
+    /// refused the blob.
+    pub fn load_plugin_state(&mut self, track: TrackId, slot: usize, data: &[u8]) -> bool {
+        let Some(strip) = self.strips.get_mut(&track) else { return false };
+        let target = if slot == INSTRUMENT_SLOT { strip.instrument.as_mut() } else { strip.plugins.get_mut(slot).and_then(Option::as_mut) };
+        target.filter(|s| !s.failed).is_some_and(|s| s.plugin.load_state(data))
+    }
+
+    /// Stops every sounding note on every instrument: the panic button. Each plugin gets its own
+    /// `allNotesOff`, and the MIDI silence messages (CC 120 All Sound Off, CC 123 All Notes Off) go
+    /// to the hosted ones too, because a note started from a plugin's own GUI keyboard never passed
+    /// through this host and only the plugin can stop it.
+    pub fn panic_all_notes(&mut self) -> usize {
+        let mut stopped = 0usize;
+        for strip in self.strips.values_mut() {
+            if let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed) {
+                inst.plugin.all_notes_off();
+                for ch in 0..16u8 {
+                    inst.plugin.midi(0, [0xB0 | ch, 120, 0]);
+                    inst.plugin.midi(0, [0xB0 | ch, 123, 0]);
+                }
+                if !strip.held.is_empty() {
+                    stopped += 1;
+                }
+                strip.held.clear();
+                strip.chase = true;
+            }
+            for slot in strip.plugins.iter_mut().flatten().filter(|slot| !slot.failed) {
+                slot.plugin.all_notes_off();
+            }
+        }
+        stopped
+    }
+
+    /// Dispatch real-time live MIDI message (Note On/Off, CC) directly to a track's instrument.
+    pub fn dispatch_live_midi(&mut self, track: TrackId, msg: [u8; 3]) {
+        if let Some(strip) = self.strips.get_mut(&track)
+            && let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed)
+        {
+            strip.live_pending = true;
+            let status = msg[0] & 0xF0;
+            let note = msg[1];
+            let vel = msg[2];
+            match status {
+                0x90 => {
+                    if vel > 0 {
+                        inst.plugin.note_on(0, note, vel);
+                        strip.held.insert(note);
+                    } else {
+                        inst.plugin.note_off(0, note);
+                        strip.held.remove(note);
+                    }
+                }
+                0x80 => {
+                    inst.plugin.note_off(0, note);
+                    strip.held.remove(note);
+                }
+                _ => {
+                    inst.plugin.midi(0, msg);
+                }
+            }
+        }
+    }
+
     /// Bring plugin instances in line with the session (creates/destroys as needed). Allocates;
     /// call outside the realtime thread when the document changes, or let `render` do it.
     pub fn sync(&mut self, s: &Session) {
@@ -571,6 +754,9 @@ impl MixEngine {
             {
                 let old = strip.instrument.take();
                 cx.retire(old);
+                strip.held.clear();
+                strip.live_pending = false;
+                strip.chase = true;
                 strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_SLOT, i, ich));
                 strip.sample = None;
             }
@@ -612,7 +798,11 @@ impl MixEngine {
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
-        if pos != self.last_end {
+        // A seek is a position that continues neither from the last block's end nor from the last
+        // block's start. The second case matters while stopped: live notes render block after
+        // block at the same playhead, and each one must not silence the notes being held.
+        let continued = pos == self.last_end || pos == self.last_pos;
+        if !continued {
             // Seek: silence held notes and ringing plugins.
             for st in self.strips.values_mut() {
                 if let Some(i) = &mut st.instrument {
@@ -622,6 +812,7 @@ impl MixEngine {
                 st.chase = true;
             }
         }
+        self.last_pos = pos;
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
         for b in self.busses.values_mut() {
@@ -927,7 +1118,6 @@ fn process_strip(
             }
         }
         TrackKind::Audio if live.monitor_only => {}
-        TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {}
         TrackKind::Audio => {
             let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
             for clip in t.clips() {
@@ -979,7 +1169,17 @@ fn process_strip(
             }
         }
         TrackKind::Instrument | TrackKind::Midi => {
+            // The live messages queued for this instrument are delivered by the `process` below.
+            strip.live_pending = false;
+            let active = t.instrument.as_ref().is_some_and(|ins| ins.active && !ins.bypass);
             if let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed) {
+                if !active {
+                    inst.plugin.all_notes_off();
+                    strip.held.clear();
+                    for c in strip.buf.iter_mut() {
+                        c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+                    }
+                } else {
                 // #152: push the instrument's stored parameter values into the live plugin
                 // before processing, the same way inserts do below. Without this, the values
                 // loaded from a session (or set via `mix.insert_state`) never reach the plugin
@@ -989,10 +1189,12 @@ fn process_strip(
                     apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
                 inst.plugin.set_transport(&transport);
-                if std::mem::take(&mut strip.chase) {
-                    chase_controllers(s, t, pos, inst);
+                if !live.monitor_only {
+                    if std::mem::take(&mut strip.chase) {
+                        chase_controllers(s, t, pos, inst);
+                    }
+                    schedule_notes(s, t, pos, frames, inst, &mut strip.held);
                 }
-                schedule_notes(s, t, pos, frames, inst, &mut strip.held);
                 if strip.buf.len() >= 2 {
                     inst.plugin.process(&mut strip.buf, frames);
                 } else if let Some(c0) = strip.buf.first_mut() {
@@ -1008,6 +1210,7 @@ fn process_strip(
                 }
                 if contain_failure(inst, &mut strip.buf, frames) {
                     strip.failures.record(INSTRUMENT_SLOT);
+                }
                 }
             }
         }
@@ -1470,7 +1673,7 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
 }
 
 /// Send note on/offs and controllers for MIDI clips overlapping the block.
-fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut Vec<u8>) {
+fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut HeldNotes) {
     let sr = s.sample_rate;
     // MIDI Track Offsets: the track's notes sound `offset` samples later (earlier if negative), so
     // the block looks that far back into the clips.
@@ -1511,13 +1714,11 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
             }
             if on >= pos && on < end {
                 inst.plugin.note_on(usize::try_from(on - pos).unwrap_or(0), n.pitch, n.velocity);
-                if !held.contains(&n.pitch) && held.len() < 128 {
-                    held.push(n.pitch);
-                }
+                held.insert(n.pitch);
             }
             if off >= pos && off < end {
                 inst.plugin.note_off(usize::try_from(off - pos).unwrap_or(0), n.pitch);
-                held.retain(|p| *p != n.pitch);
+                held.remove(n.pitch);
             }
         }
         let near = s.tempo.samples_to_ticks(pos, sr).saturating_sub(base).saturating_sub(1)
@@ -1645,6 +1846,40 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
         latency = latency.saturating_add(slot.plugin.latency());
     }
     strip.latency = latency.min(MAX_LATENCY);
+}
+
+/// The key a plugin parameter is matched by: lower-case ASCII letters and digits only, so
+/// `"H-Drive 2"`, `" h drive 2 "` and `"hdrive2"` all compare equal.
+fn param_key(name: &str) -> String {
+    name.chars().flat_map(char::to_lowercase).filter(|c| c.is_ascii_alphanumeric()).collect()
+}
+
+/// The id of the parameter `name_or_id` means in this plugin's own list. An exact id wins (`"4"` for a
+/// VST3 `ParamID`, `"cutoff"` for a built-in, a dotted name for CLAP); then the plugin-side title,
+/// matched without case or punctuation; then a title that contains the request (or that the request
+/// contains), shortest first so `"Drive"` finds `"Drive Amount"` rather than an unrelated parameter.
+///
+/// Names are how console controls and automation lanes say what they mean, while plugin formats address
+/// parameters by id: this is the one place that translates between them.
+pub fn find_param_id(info: &soundcraft_dsp::PluginInfo, name_or_id: &str) -> Option<&'static str> {
+    if let Some(param) = info.param(name_or_id) {
+        return Some(param.id);
+    }
+    // A digit-only request that is not a real id stays unmatched: "4" must not find "Room 4".
+    if name_or_id.is_empty() || name_or_id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let key = param_key(name_or_id);
+    if key.is_empty() {
+        return None;
+    }
+    info.params.iter().find(|p| param_key(p.name) == key).or_else(|| {
+        let mut hits: Vec<&soundcraft_dsp::ParamInfo> =
+            info.params.iter().filter(|p| !param_key(p.name).is_empty() && (param_key(p.name).contains(&key) || key.contains(&param_key(p.name)))).collect();
+        hits.sort_by_key(|p| (p.name.len(), p.id));
+        hits.into_iter().next()
+    })
+    .map(|p| p.id)
 }
 
 fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
@@ -2293,6 +2528,58 @@ mod tests {
     }
 
     #[test]
+    fn live_notes_are_audible_while_stopped_block_after_block() {
+        // The device callback keeps rendering at the same playhead while the transport is
+        // stopped; a held live note must survive the seek detection on every block.
+        let s = synth_session(0.0);
+        let tid = s.tracks.iter().find(|t| t.kind == TrackKind::Instrument).expect("instrument").id;
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.sync(&s);
+        eng.monitor_only = true;
+        eng.dispatch_live_midi(tid, [0x90, 60, 100]);
+        assert!(eng.has_live_held());
+        let mut first = vec![vec![0.0f32; 512]; 2];
+        eng.render(&s, 0, 512, &mut first);
+        let mut second = vec![vec![0.0f32; 512]; 2];
+        eng.render(&s, 0, 512, &mut second);
+        let peak = first.iter().chain(second.iter()).flatten().fold(0.0f32, |a, b| a.max(b.abs()));
+        assert!(peak > 0.001, "a live note must sound while stopped, peak {peak}");
+        // A real seek still releases the notes.
+        assert!(eng.has_live_held());
+        eng.render(&s, 48_000, 512, &mut vec![vec![0.0f32; 512]; 2]);
+        assert!(!eng.has_live_held(), "a seek releases held live notes");
+    }
+
+    #[test]
+    fn live_keyboard_does_not_retrigger_midi_clips_while_transport_is_stopped() {
+        use soundcraft_midi::{Note, Sequence};
+
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.keys"));
+        let mut sequence = Sequence::default();
+        sequence.notes.push(Note { pitch: 67, velocity: 90, release_velocity: 64, channel: 0, start: 0, length: 960 });
+        let cid = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "stopped", 0, 24_000, sequence));
+
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plugin = Sounding { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard), pending: Vec::new() };
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.sync(&s);
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(plugin) }]);
+        eng.ensure_synced(&s);
+        eng.monitor_only = true;
+        eng.dispatch_live_midi(t, [0x90, 60, 100]);
+
+        for _ in 0..3 {
+            render_block(&mut eng, &s, 0);
+        }
+
+        assert_eq!(*heard.lock().unwrap(), vec![[0x90, 60, 100]], "stopped MIDI clips must not retrigger at a frozen playhead");
+    }
+
+    #[test]
     fn stored_instrument_params_reach_the_plugin() {
         // #152: a saved instrument level of -12 dB must render quieter than -6 dB.
         // RMS over the held part of the note, past any parameter smoothing.
@@ -2519,6 +2806,50 @@ mod tests {
         }
     }
 
+    /// A plugin that publishes one program list and remembers the state it was given, so the
+    /// instrument→preset path can be tested without a VST.
+    struct Programmable {
+        inner: Box<dyn Plugin>,
+        loaded: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Plugin for Programmable {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+        }
+        fn program_lists(&self) -> Vec<soundcraft_dsp::ProgramList> {
+            vec![soundcraft_dsp::ProgramList { id: 1, name: "Factory".into(), programs: vec!["Concert Grand".into(), "Studio Grand".into()] }]
+        }
+        fn select_program(&mut self, list: usize, program: usize) -> bool {
+            list == 0 && program < 2
+        }
+        fn save_state(&mut self) -> Option<Vec<u8>> {
+            Some(b"state".to_vec())
+        }
+        fn load_state(&mut self, data: &[u8]) -> bool {
+            if let Ok(mut l) = self.loaded.lock() {
+                l.clear();
+                l.extend_from_slice(data);
+            }
+            true
+        }
+    }
+
     struct Clock {
         inner: Box<dyn Plugin>,
         seen: Arc<std::sync::Mutex<Vec<Transport>>>,
@@ -2600,6 +2931,84 @@ mod tests {
     }
 
     #[test]
+    fn a_live_note_stops_when_its_note_off_arrives() {
+        // The virtual keyboard path: note-on, note-off a moment later. The instrument must be told
+        // to stop, and the strip must not keep the pitch as held (a held pitch is chased and
+        // re-sent, which is how a "stuck" note keeps retriggering).
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.keys"));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let sounding = Sounding { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard), pending: Vec::new() };
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(sounding) }]);
+        render_block(&mut eng, &s, 0);
+        eng.dispatch_live_midi(t, [0x90, 60, 100]);
+        render_block(&mut eng, &s, 512);
+        assert!(heard.lock().unwrap().contains(&[0x90, 60, 100]), "the note started");
+        eng.dispatch_live_midi(t, [0x80, 60, 0]);
+        render_block(&mut eng, &s, 1024);
+        let seen = std::mem::take(&mut *heard.lock().unwrap());
+        assert!(seen.iter().any(|m| m[0] & 0xF0 == 0x80 && m[1] == 60), "the note stopped (heard {seen:?})");
+        assert!(!eng.has_live_held(), "nothing is left held after the release");
+    }
+
+    #[test]
+    fn a_live_note_off_reaches_the_instrument_even_with_the_transport_stopped() {
+        // Monitor-only mode skips instrument strips that hold nothing, and a note-off is exactly
+        // the moment nothing is held any more: the release used to stay in the queue and the note
+        // sounded forever (the "stuck note" from the on-screen keyboard).
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.keys"));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.monitor_only = true;
+        let sounding = Sounding { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard), pending: Vec::new() };
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(sounding) }]);
+        render_block(&mut eng, &s, 0);
+        eng.dispatch_live_midi(t, [0x90, 62, 100]);
+        render_block(&mut eng, &s, 512);
+        assert!(heard.lock().unwrap().contains(&[0x90, 62, 100]), "the note started");
+        std::mem::take(&mut *heard.lock().unwrap());
+        eng.dispatch_live_midi(t, [0x80, 62, 0]);
+        render_block(&mut eng, &s, 1024);
+        let seen = std::mem::take(&mut *heard.lock().unwrap());
+        assert!(seen.iter().any(|m| m[0] & 0xF0 == 0x80 && m[1] == 62), "the release reached the plugin (heard {seen:?})");
+        // Nothing is left pending: the strip may be skipped again.
+        render_block(&mut eng, &s, 1536);
+        assert!(heard.lock().unwrap().is_empty(), "and nothing is repeated afterwards");
+    }
+
+    #[test]
+    fn the_panic_stops_every_instrument_and_forgets_the_held_notes() {
+        // "All MIDI Notes Off" has to stop a note that this host never saw start (a click on the
+        // keyboard inside a plugin's own GUI): the plugin gets its own allNotesOff plus the MIDI
+        // silence controllers.
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.keys"));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let sounding = Sounding { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard), pending: Vec::new() };
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(sounding) }]);
+        render_block(&mut eng, &s, 0);
+        eng.dispatch_live_midi(t, [0x90, 60, 100]);
+        render_block(&mut eng, &s, 512);
+        assert!(eng.has_live_held());
+        let stopped = eng.panic_all_notes();
+        assert_eq!(stopped, 1, "the track's held note is counted");
+        assert!(!eng.has_live_held(), "and cleared");
+        render_block(&mut eng, &s, 1024);
+        let seen = std::mem::take(&mut *heard.lock().unwrap());
+        assert!(seen.contains(&[0xB0, 123, 0]), "the plugin is told to stop (heard {seen:?})");
+        assert!(seen.iter().any(|m| m[0] == 0xB0 && m[1] == 120), "and gets All Sound Off");
+    }
+
+    #[test]
     fn controllers_play_at_their_offsets_and_are_chased_after_a_seek() {
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
@@ -2620,6 +3029,54 @@ mod tests {
         assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(0, [0xB0, 121, 0]), (0, [0xB0, 64, 127]), (0, [0xE0, 0, 0])]);
         render_block(&mut eng, &s, 36_512);
         assert!(heard.lock().unwrap().is_empty());
+    }
+
+    /// Records the note events it is given, on and off, so a live note can be followed to its end.
+    /// Events are queued and only delivered by `process`, like a VST3 instance: that is what makes
+    /// "did the host actually flush it?" observable.
+    struct Sounding {
+        inner: Box<dyn Plugin>,
+        heard: Arc<std::sync::Mutex<Vec<[u8; 3]>>>,
+        pending: Vec<[u8; 3]>,
+    }
+
+    impl Plugin for Sounding {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+            if !self.pending.is_empty() {
+                let mut heard = self.heard.lock().unwrap();
+                for m in self.pending.drain(..) {
+                    heard.push(m);
+                }
+            }
+        }
+        fn note_on(&mut self, _offset: usize, note: u8, velocity: u8) {
+            self.pending.push([0x90, note, velocity]);
+        }
+        fn note_off(&mut self, _offset: usize, note: u8) {
+            self.pending.push([0x80, note, 0]);
+        }
+        fn all_notes_off(&mut self) {
+            self.pending.push([0xB0, 123, 0]);
+        }
+        fn midi(&mut self, _offset: usize, msg: [u8; 3]) {
+            self.pending.push(msg);
+        }
     }
 
     struct Keys {
@@ -2719,6 +3176,78 @@ mod tests {
         assert!(eng.drain_plugins().is_empty());
     }
 
+    /// A hosted plugin as the mix sees it: parameters addressed by the names its own list publishes.
+    struct Named {
+        sets: Arc<std::sync::Mutex<Vec<(String, f32)>>>,
+    }
+
+    fn named_info() -> &'static soundcraft_dsp::PluginInfo {
+        use soundcraft_dsp::{Category, ParamInfo, PluginInfo, Taper, Unit};
+        static PARAMS: &[soundcraft_dsp::ParamInfo] = &[
+            ParamInfo { id: "0", name: "Drive Amount", min: 0.0, max: 10.0, default: 0.0, unit: Unit::None, taper: Taper::Linear, choices: &[] },
+            ParamInfo { id: "1", name: "Mix", min: 0.0, max: 1.0, default: 0.5, unit: Unit::Percent, taper: Taper::Linear, choices: &[] },
+            ParamInfo { id: "2", name: "Feedback Drive", min: 0.0, max: 1.0, default: 0.0, unit: Unit::None, taper: Taper::Linear, choices: &[] },
+        ];
+        static INFO: soundcraft_dsp::PluginInfo =
+            PluginInfo { id: "clap:test.named", name: "Named", short_name: "Named", category: Category::Other, params: PARAMS, is_instrument: false, audiosuite: false };
+        &INFO
+    }
+
+    impl Plugin for Named {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            named_info()
+        }
+        fn prepare(&mut self, _sr: f32, _mb: usize, _ch: usize) {}
+        fn reset(&mut self) {}
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            let Some(info) = named_info().param(id) else { return false };
+            self.sets.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((info.name.to_string(), info.clamp(v)));
+            true
+        }
+        fn param(&self, _id: &str) -> Option<f32> {
+            None
+        }
+        fn process(&mut self, _io: &mut [Vec<f32>], _frames: usize) {}
+    }
+
+    #[test]
+    fn a_plugin_parameter_can_be_addressed_by_the_name_the_plugin_uses() {
+        let info = named_info();
+        // Ids first, exactly as the plugin format addresses them.
+        assert_eq!(find_param_id(info, "1"), Some("1"));
+        // Then the plugin-side title, ignoring case and punctuation.
+        assert_eq!(find_param_id(info, "drive amount"), Some("0"));
+        assert_eq!(find_param_id(info, "Drive-Amount!"), Some("0"));
+        // Then a title that contains the request: the shortest, so "Drive" means the drive knob and
+        // not an unrelated feedback parameter that happens to mention it.
+        assert_eq!(find_param_id(info, "drive"), Some("0"));
+        // Nothing at all for names no parameter answers to, and a bare number is never a name.
+        assert_eq!(find_param_id(info, "reverb size"), None);
+        assert_eq!(find_param_id(info, "7"), None);
+        assert_eq!(find_param_id(info, ""), None);
+    }
+
+    #[test]
+    fn an_on_screen_control_moves_a_live_plugin_parameter_by_name() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.named"));
+        let sets = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.named".into(), ch: 1, plugin: Box::new(Named { sets: Arc::clone(&sets) }) }]);
+        render_block(&mut eng, &s, 0);
+        // The console knob says "Drive Amount"; the plugin gets parameter `0`, clamped into its range.
+        assert!(eng.set_plugin_param_by_label(t, 0, "Drive Amount", 4.0), "the named parameter moved");
+        assert!(eng.set_plugin_param_by_label(t, 0, "drive amount", 99.0), "a value past the top arrives at the plugin's own maximum");
+        // Unknown names and empty slots do nothing at all (and never panic).
+        assert!(!eng.set_plugin_param_by_label(t, 0, "Nothing Like This", 1.0));
+        assert!(!eng.set_plugin_param_by_label(t, 3, "Mix", 1.0));
+        assert!(!eng.set_plugin_param_by_label(TrackId(9_999), 0, "Mix", 1.0));
+        assert!(!eng.set_plugin_param_by_label(t, 0, "Mix", f32::NAN));
+        let heard = sets.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        assert_eq!(heard, vec![("Drive Amount".to_string(), 4.0), ("Drive Amount".to_string(), 10.0)]);
+    }
+
     struct Nan(Box<dyn Plugin>);
 
     impl Plugin for Nan {
@@ -2810,6 +3339,36 @@ mod tests {
         let mut retired = eng.take_retired();
         assert_eq!(retired.len(), 1, "the old instance is retired");
         assert_eq!(retired[0].save_state(), Some(b"old".to_vec()), "the new instance stays");
+    }
+
+    #[test]
+    fn a_console_reads_programs_and_applies_a_saved_preset_on_a_live_plugin() {
+        // The instrument→preset path, without a VST: the plugin publishes one program list, and a
+        // saved state blob goes back into the live instance (what "apply preset" does).
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("vst3:00000000000000000000000000000002"));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let loaded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut gain = soundcraft_dsp::create("gain").unwrap();
+        gain.prepare(48_000.0, 512, 2);
+        let fake = Programmable { inner: gain, loaded: Arc::clone(&loaded) };
+        eng.adopt(vec![PreparedInstance {
+            track: t,
+            slot: INSTRUMENT_SLOT,
+            id: "vst3:00000000000000000000000000000002".into(),
+            ch: 2,
+            plugin: Box::new(fake),
+        }]);
+        render_block(&mut eng, &s, 0);
+        let lists = eng.plugin_programs(t, INSTRUMENT_SLOT);
+        assert_eq!(lists.len(), 1, "the plugin's program list is readable");
+        assert_eq!(lists[0].programs, vec!["Concert Grand".to_string(), "Studio Grand".to_string()]);
+        assert!(eng.select_plugin_program(t, INSTRUMENT_SLOT, 0, 1), "a listed program is selectable");
+        assert!(!eng.select_plugin_program(t, INSTRUMENT_SLOT, 0, 9), "an out-of-range program is refused");
+        assert!(eng.load_plugin_state(t, INSTRUMENT_SLOT, b"preset"), "a saved preset goes into the live plugin");
+        assert_eq!(loaded.lock().map(|l| l.clone()).unwrap_or_default(), b"preset".to_vec());
+        assert_eq!(eng.capture_plugin_state(t, INSTRUMENT_SLOT), Some(b"state".to_vec()), "the live state can be captured to bind a preset");
     }
 
     #[test]
@@ -3241,5 +3800,61 @@ mod tests {
         }
         let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
         assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
+    }
+
+    #[test]
+    fn bypassed_or_inactive_instrument_is_not_active_in_has_active_plugins() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.keys"));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sounding = Sounding { inner: soundcraft_dsp::create("gain").unwrap(), heard, pending: Vec::new() };
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(sounding) }]);
+        eng.sync(&s);
+        assert!(eng.has_active_plugins(&s));
+
+        // Inactive track -> false
+        s.track_mut(t).unwrap().inactive = true;
+        assert!(!eng.has_active_plugins(&s));
+        s.track_mut(t).unwrap().inactive = false;
+
+        // Bypassed instrument -> false
+        s.track_mut(t).unwrap().instrument.as_mut().unwrap().bypass = true;
+        assert!(!eng.has_active_plugins(&s));
+        s.track_mut(t).unwrap().instrument.as_mut().unwrap().bypass = false;
+
+        // Inactive instrument -> false
+        s.track_mut(t).unwrap().instrument.as_mut().unwrap().active = false;
+        assert!(!eng.has_active_plugins(&s));
+    }
+
+    #[test]
+    fn replacing_instrument_clears_held_notes_and_silences_old() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.keys1"));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let heard1 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sounding1 = Sounding { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard1), pending: Vec::new() };
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys1".into(), ch: 2, plugin: Box::new(sounding1) }]);
+        eng.sync(&s);
+
+        eng.dispatch_live_midi(t, [0x90, 60, 100]);
+        assert!(eng.has_live_held());
+
+        // Replace instrument
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.keys2"));
+        let heard2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sounding2 = Sounding { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard2), pending: Vec::new() };
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys2".into(), ch: 2, plugin: Box::new(sounding2) }]);
+        eng.sync(&s);
+
+        // strip.held must be cleared!
+        assert!(!eng.has_live_held(), "strip.held is cleared on instrument swap");
+        let retired = eng.take_retired();
+        assert!(!retired.is_empty(), "old plugin was retired");
     }
 }

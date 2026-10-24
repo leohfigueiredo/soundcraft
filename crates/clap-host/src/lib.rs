@@ -54,7 +54,7 @@ pub fn parse_id(id: &str) -> Option<&str> {
 }
 
 /// One plugin found by a scan.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClapDescriptor {
     /// SoundCraft id: `clap:<plugin_id>`.
     pub id: String,
@@ -102,6 +102,18 @@ mod api {
     pub fn add_search_dir(dir: &Path) -> usize {
         registry::add_search_dir(dir)
     }
+    pub fn register_search_dir(dir: &Path) {
+        registry::register_search_dir(dir)
+    }
+    pub fn adopt_scan(descriptors: Vec<ClapDescriptor>) {
+        registry::adopt_scan(descriptors)
+    }
+    pub fn extra_dirs() -> Vec<PathBuf> {
+        registry::extra_dirs()
+    }
+    pub fn bundle_path(id: &str) -> Option<std::path::PathBuf> {
+        registry::bundle_path(id)
+    }
     pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
         registry::scan_paths(dirs)
     }
@@ -113,6 +125,12 @@ mod api {
     }
     pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         registry::plugin_info(id)
+    }
+    pub fn descriptor_info(id: &str) -> Option<&'static PluginInfo> {
+        registry::descriptor_info(id)
+    }
+    pub fn cached_plugin_info(id: &str) -> Option<&'static PluginInfo> {
+        registry::cached_plugin_info(id)
     }
 }
 
@@ -132,6 +150,14 @@ mod api {
     pub fn add_search_dir(_dir: &Path) -> usize {
         0
     }
+    pub fn register_search_dir(_dir: &Path) {}
+    pub fn adopt_scan(_descriptors: Vec<ClapDescriptor>) {}
+    pub fn extra_dirs() -> Vec<PathBuf> {
+        Vec::new()
+    }
+    pub fn bundle_path(_id: &str) -> Option<std::path::PathBuf> {
+        None
+    }
     pub fn scan_paths(_dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
         Vec::new()
     }
@@ -142,6 +168,12 @@ mod api {
         Err(ClapError::Unsupported)
     }
     pub fn plugin_info(_id: &str) -> Option<&'static PluginInfo> {
+        None
+    }
+    pub fn descriptor_info(_id: &str) -> Option<&'static PluginInfo> {
+        None
+    }
+    pub fn cached_plugin_info(_id: &str) -> Option<&'static PluginInfo> {
         None
     }
 }
@@ -162,6 +194,27 @@ pub fn rescan() -> Vec<ClapDescriptor> {
 /// plugins the folder holds.
 pub fn add_search_dir(dir: &Path) -> usize {
     api::add_search_dir(dir)
+}
+
+/// Registers a search folder without scanning it (the next [`rescan`] picks it up). Cheap enough
+/// for the UI thread.
+pub fn register_search_dir(dir: &Path) {
+    api::register_search_dir(dir)
+}
+
+/// Replaces the catalogue with a scan made elsewhere (see `soundcraft --scan-plugins`).
+pub fn adopt_scan(descriptors: Vec<ClapDescriptor>) {
+    api::adopt_scan(descriptors)
+}
+
+/// The folders registered for scanning (the standard ones are not included).
+pub fn extra_dirs() -> Vec<PathBuf> {
+    api::extra_dirs()
+}
+
+/// The bundle a plugin id lives in, from the catalogue (no plugin code is loaded).
+pub fn bundle_path(id: &str) -> Option<std::path::PathBuf> {
+    api::bundle_path(id)
 }
 
 /// Scans the given folders without touching the cache.
@@ -203,9 +256,42 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
     api::plugin_info(id)
 }
 
+/// A plugin's catalogue entry without loading it: the id, the name, the kind and the category,
+/// with no parameters (a hosted plugin keeps those in its own state).
+pub fn descriptor_info(id: &str) -> Option<&'static PluginInfo> {
+    api::descriptor_info(id)
+}
+
+/// What this process already knows about a plugin **without loading anything**: its parameters once
+/// one has been instantiated, otherwise [`descriptor_info`]'s entry. Use this on any per-frame UI
+/// path; [`plugin_info`] loads the module to read the parameters.
+pub fn cached_plugin_info(id: &str) -> Option<&'static PluginInfo> {
+    api::cached_plugin_info(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_descriptor_round_trips_through_the_scanner_protocol() {
+        let d = ClapDescriptor {
+            id: "clap:org.test.gain".to_string(),
+            plugin_id: "org.test.gain".to_string(),
+            name: "Gain".to_string(),
+            vendor: "Test".to_string(),
+            version: "1.0".to_string(),
+            description: "a test gain".to_string(),
+            features: vec!["audio-effect".to_string()],
+            category: soundcraft_dsp::Category::Other,
+            is_instrument: false,
+            path: std::path::PathBuf::from("/some/Gain.clap"),
+        };
+        let json = serde_json::to_string(&serde_json::json!({"clap": d.clone()})).expect("serialise");
+        let line: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let back: ClapDescriptor = serde_json::from_value(line["clap"].clone()).expect("deserialise");
+        assert_eq!(back, d);
+    }
 
     #[test]
     fn ids_parse() {

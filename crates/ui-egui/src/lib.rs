@@ -4,7 +4,11 @@
 //! executing commands. It can be replaced without touching anything below it.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod analoglab_console;
+#[cfg(target_os = "linux")]
+pub mod ble_midi;
 pub mod bounce;
+pub mod console_kit;
 pub mod control;
 pub mod credits;
 pub mod dialogs;
@@ -12,13 +16,22 @@ pub mod docking;
 pub mod edit_window;
 pub mod extra_windows;
 pub mod fonts;
+pub mod fx_browser;
 pub mod icons;
+pub mod kontakt_console;
+pub mod labs_console;
 pub mod menus;
 pub mod midi_editor;
+pub mod midi_io;
+pub mod mix_dock;
 pub mod mix_window;
+pub mod msc_mixer;
+pub mod omnisphere_console;
 pub mod ops_windows;
 pub mod palette;
 pub mod panels;
+pub mod pianoteq_console;
+pub mod pigments_console;
 mod recent;
 pub mod recovery;
 pub mod sampler_window;
@@ -29,6 +42,7 @@ pub mod theme;
 pub mod toolbar;
 pub mod video_track;
 pub mod video_window;
+pub mod virtual_keyboard;
 pub mod waveform;
 pub mod widgets;
 pub mod windows;
@@ -94,9 +108,40 @@ pub struct UiState {
     pub show_metadata: bool,
     pub show_event_list: bool,
     pub show_midi_keyboard: bool,
+    /// The mixer dock under the Edit timeline (every track's fader on the main screen). Not
+    /// persisted: it is always there on startup, so the console can never "disappear" between
+    /// runs. Hiding it lasts for the session only.
+    #[serde(skip)]
+    pub show_mixer_dock: bool,
+    /// The MIDI monitor window (live message log, ports, subscriptions).
+    pub show_midi_monitor: bool,
+    /// The Reaper-style MIDI Devices window.
+    pub show_midi_devices: bool,
     pub show_workspace: bool,
     pub show_configurations: bool,
     pub show_playback_engine: bool,
+    pub show_msc_hardware: bool,
+    /// The alternative GUI window (one per app, with an instrument tab row inside): its own window,
+    /// next to the plugin's editors rather than instead of them.
+    pub show_console: bool,
+    /// The instrument the console shows ("pianoteq", "omnisphere", …).
+    pub console_profile: String,
+    /// What each instrument's controls hold (values, preset, velocity curve, MIDI channel).
+    pub consoles: std::collections::BTreeMap<String, console_kit::ConsoleState>,
+    /// The last MIDI message the console sent, and when (its activity light). Session only.
+    #[serde(skip)]
+    pub console_sent: Option<([u8; 3], f64)>,
+    /// Which track's instrument the open console last followed. Runtime-only: it is what lets the
+    /// console jump to an instrument as it is selected without fighting the tab row when the user
+    /// picks an instrument himself (`console_kit::follow_selection`).
+    #[serde(skip)]
+    pub console_followed: Option<TrackId>,
+    pub show_fx_browser: Option<TrackId>,
+    pub show_vst_folders: bool,
+    /// The hardware controller setup: mapping, control mode, soft takeover, learned links.
+    pub msc: msc_mixer::MscPrefs,
+    /// The virtual keyboard setup: range, octave, velocity, step input.
+    pub keyboard: virtual_keyboard::KeyboardPrefs,
     /// The audio device choice (Setup › Playback Engine), kept with the preferences: per machine.
     pub audio: soundcraft_playback::AudioConfig,
     /// The Mix window lives in its own native window (Window › Mix in Separate Window); the main
@@ -161,9 +206,22 @@ impl Default for UiState {
             show_metadata: false,
             show_event_list: false,
             show_midi_keyboard: false,
+            show_mixer_dock: true,
+            show_midi_monitor: false,
+            show_midi_devices: false,
             show_workspace: false,
             show_configurations: false,
             show_playback_engine: false,
+            show_msc_hardware: false,
+            show_console: false,
+            console_profile: "pianoteq".to_string(),
+            consoles: std::collections::BTreeMap::new(),
+            console_sent: None,
+            console_followed: None,
+            show_fx_browser: None,
+            show_vst_folders: false,
+            msc: msc_mixer::MscPrefs::default(),
+            keyboard: virtual_keyboard::KeyboardPrefs::default(),
             audio: soundcraft_playback::AudioConfig::default(),
             mix_separate: false,
             show_io_setup: false,
@@ -246,6 +304,9 @@ pub enum Gesture {
 
 pub struct SoundApp {
     pub engine: Engine,
+    /// The last live MIDI messages the keyboard or the console sent (bounded, newest last): what a
+    /// stuck note or a retrigger looks like from the outside, for tests and the control channel.
+    pub live_midi_log: std::collections::VecDeque<(u64, [u8; 3])>,
     /// The session path as of the last frame, and whether the recent list changed since the host
     /// last saved it (see `recent`).
     recent_seen: Option<String>,
@@ -292,6 +353,11 @@ pub struct SoundApp {
     pub ops: ops_windows::OpsState,
     pub extra: extra_windows::ExtraState,
     pub palette: palette::PaletteState,
+    pub msc: msc_mixer::MscManager,
+    /// Hardware MIDI I/O for the control surface, when the app started it (see
+    /// [`SoundApp::start_control_surface`]). `None` in tests and offscreen renders.
+    pub midi_io: Option<midi_io::MidiIo>,
+    pub keyboard: virtual_keyboard::KeyboardState,
     /// Bring the separate Mix window to the front on the next frame.
     pub(crate) focus_mix: bool,
     pub synthetic: Vec<egui::Event>,
@@ -304,8 +370,20 @@ pub struct SoundApp {
     last_rev: u64,
     fonts_ready: bool,
     fonts_installed: bool,
-    /// The palette last applied to the context (light?), so visuals are set only on a change.
-    theme_applied: Option<bool>,
+    /// The palette last applied to the context, so visuals are set only on a change.
+    theme_applied: Option<theme::ThemeMode>,
+    /// Set when a preference that `config.json` holds changed (theme, controller setup).
+    prefs_dirty: bool,
+    /// The MIDI keyboard was auto-attached once this session (so a later disconnect sticks).
+    auto_keyboard_done: bool,
+    /// The live-MIDI handle the MIDI worker plays keyboard notes through, and the track it targets.
+    live_sink: Option<soundcraft_playback::LiveMidiSink>,
+    live_target: Option<TrackId>,
+    /// The plugin scan was running on the previous frame (to retry instances once it finishes).
+    was_scanning: bool,
+    /// When a background catalogue pass was last started because a session asked for a plugin the
+    /// catalogue has no bundle for. Debounced, so a stuck plugin cannot start one scan per frame.
+    catalogue_retry_at: Option<std::time::Instant>,
     /// Last panel host context, used to cancel renderer-owned gestures on explicit replacement.
     pub(crate) docking_context: Option<egui::Context>,
     /// Transport simulation when there is no player (tests, offscreen renders).
@@ -322,6 +400,15 @@ pub struct SoundApp {
     pub frame_ms: f32,
     last_frame: Option<f64>,
     last_meter_poll: f64,
+    /// When the control-surface traffic was last written to the log file, and the last line
+    /// written, so a fader sweep logs a readable sample instead of a burst.
+    msc_log: Option<(f64, String)>,
+    /// The plugin-validation generation last acted on, so a plugin that just proved loadable in a
+    /// child process is instantiated without the user repeating the insert.
+    probes_seen: u64,
+    /// Pending editor to open as soon as its plugin validation / instance is ready.
+    pub(crate) pending_gui: Option<(TrackId, usize)>,
+    pending_gui_frames: u32,
     /// Movies for the Video window and Video track (decoded in the background).
     pub video: video_track::VideoPool,
     /// The Bounce Mix in progress, rendered a slice per frame.
@@ -344,7 +431,9 @@ fn automation_step_due(pos: Samples, last: Samples, step: Samples) -> bool {
 
 impl SoundApp {
     pub fn new(engine: Engine, player: Option<Player>, services: Services) -> Self {
+        crate::fx_browser::load_plugin_cache();
         SoundApp {
+            live_midi_log: std::collections::VecDeque::new(),
             recent_seen: engine.path.clone(),
             recent_changed: false,
             recent_checked: None,
@@ -377,6 +466,9 @@ impl SoundApp {
             ops: ops_windows::OpsState::default(),
             extra: extra_windows::ExtraState::default(),
             palette: palette::PaletteState::default(),
+            msc: msc_mixer::MscManager::default(),
+            midi_io: None,
+            keyboard: virtual_keyboard::KeyboardState::new(),
             focus_mix: false,
             synthetic: Vec::new(),
             sample_drop_targets: Vec::new(),
@@ -388,6 +480,12 @@ impl SoundApp {
             fonts_ready: false,
             fonts_installed: false,
             theme_applied: None,
+            prefs_dirty: false,
+            auto_keyboard_done: false,
+            catalogue_retry_at: None,
+            live_sink: None,
+            live_target: None,
+            was_scanning: false,
             docking_context: None,
             sim: None,
             record_hint: None,
@@ -398,6 +496,10 @@ impl SoundApp {
             frame_ms: 0.0,
             last_frame: None,
             last_meter_poll: f64::NEG_INFINITY,
+            msc_log: None,
+            probes_seen: 0,
+            pending_gui: None,
+            pending_gui_frames: 0,
             video: video_track::VideoPool::default(),
             bounce: None,
             #[cfg(test)]
@@ -435,6 +537,9 @@ impl SoundApp {
                     // Re-selecting a scrolling mode resumes the playhead follow.
                     self.edit_layout.follow_hold = false;
                 }
+                if id == "ui.theme" || id.starts_with("controller.") {
+                    self.prefs_dirty = true;
+                }
                 if id == "track.clear_clip_indicators" {
                     self.meters.values_mut().chain([&mut self.main_meter]).for_each(|m| m.clip = false);
                 }
@@ -446,6 +551,11 @@ impl SoundApp {
                 Err(e.to_string())
             }
         }
+    }
+
+    /// True once after a preference that must be written to `config.json` changed.
+    pub fn take_prefs_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.prefs_dirty)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -462,6 +572,274 @@ impl SoundApp {
     /// Current transport position (playhead while playing, else the edit insertion).
     pub fn position(&self) -> Samples {
         if self.engine.transport.playing { self.engine.transport.position } else { self.engine.session().edit.selection.start }
+    }
+
+    /// Send a real-time live MIDI message (Note On/Off, CC) to a track's instrument.
+    pub fn send_live_midi(&mut self, track: TrackId, msg: [u8; 3]) {
+        if self.live_midi_log.len() >= 128 {
+            self.live_midi_log.pop_front();
+        }
+        self.live_midi_log.push_back((track.0, msg));
+        if let Some(player) = &self.player {
+            player.send_live_midi(track, msg);
+        }
+    }
+
+    /// Plays one live MIDI message from a hardware keyboard (a piano, a controller) on the active
+    /// instrument track, and lights the on-screen keys for notes.
+    pub fn play_live_note(&mut self, msg: [u8; 3]) {
+        let Some(track) = crate::virtual_keyboard::active_target_track(self) else { return };
+        self.light_keys(msg);
+        self.send_live_midi(track, msg);
+    }
+
+    /// Lights (Note On) or darkens (Note Off, or Note On at velocity 0) an on-screen key.
+    pub fn light_keys(&mut self, msg: [u8; 3]) {
+        let status = msg[0] & 0xF0;
+        if matches!(status, 0x90 | 0x80) {
+            let note = msg[1] & 0x7F;
+            if status == 0x90 && msg[2] > 0 {
+                self.keyboard.held_notes.insert(note);
+            } else {
+                self.keyboard.held_notes.remove(&note);
+            }
+        }
+    }
+
+    /// Keeps the MIDI worker's direct path pointed at the current player and instrument track.
+    /// When the target changes, the previous track gets sustain off and All Notes Off on every
+    /// channel, so a chord held across the change cannot hang there.
+    fn sync_live_midi(&mut self, ctx: &egui::Context) {
+        let (Some(io), Some(p)) = (&self.midi_io, &self.player) else { return };
+        io.set_waker(ctx.clone());
+        let target = crate::virtual_keyboard::active_target_track(self);
+        let sink = p.live_midi_sink();
+        let renewed = !self.live_sink.as_ref().is_some_and(|s| s.same_player(&sink));
+        if renewed || target != self.live_target {
+            if let Some(old) = self.live_target.filter(|old| Some(*old) != target) {
+                for ch in 0..16u8 {
+                    p.send_live_midi(old, [0xB0 | ch, 64, 0]);
+                    p.send_live_midi(old, [0xB0 | ch, 123, 0]);
+                }
+            }
+            p.set_live_target(target);
+            self.live_target = target;
+        }
+        if renewed {
+            io.set_live_sink(Some(sink.clone()));
+            self.live_sink = Some(sink);
+        }
+    }
+
+    /// Dispatch a raw MIDI message from the MSC hardware mixer or external controller.
+    pub fn handle_msc_midi(&mut self, msg: &[u8]) -> Option<String> {
+        let mut msc = std::mem::take(&mut self.msc);
+        let res = msc.handle_message(self, msg);
+        self.msc = msc;
+        res
+    }
+
+    /// Starts the hardware MIDI worker for the control surface. Idempotent, never blocks and
+    /// never fails: a missing MIDI layer is reported in [`MscManager::link`] instead.
+    pub fn start_control_surface(&mut self, filter: impl Into<String>) {
+        if self.midi_io.is_some() {
+            return;
+        }
+        if self.msc.keyboard_port.as_deref().is_some_and(|keyboard| self.msc.surface_port.as_deref() == Some(keyboard)) {
+            if let Some(port) = self.msc.surface_port.take() {
+                log::warn!("MIDI: `{port}` is selected as both keyboard and control surface; keeping it as the keyboard");
+            }
+            self.ui.msc.surface_port = None;
+        }
+        let filter = filter.into();
+        self.midi_io = Some(midi_io::MidiIo::start(filter));
+    }
+
+    /// Copies runtime controller and keyboard state into the persisted UI state. Call before
+    /// writing `config.json`.
+    pub fn sync_prefs(&mut self) {
+        self.ui.msc = self.msc.prefs();
+        self.ui.keyboard = self.keyboard.prefs();
+    }
+
+    /// Applies the persisted controller and keyboard state after loading the preferences.
+    pub fn apply_runtime_prefs(&mut self) {
+        self.msc.apply_prefs(&self.ui.msc);
+        self.keyboard.apply_prefs(&self.ui.keyboard);
+    }
+
+    /// Re-reads the MIDI port list (hot-plug without waiting for the next poll).
+    pub fn control_surface_rescan(&mut self) {
+        if let Some(io) = &self.midi_io {
+            io.rescan();
+        }
+    }
+
+    /// Changes which device names the control-surface link matches.
+    pub fn control_surface_filter(&mut self, filter: impl Into<String>) {
+        let filter = filter.into();
+        if let Some(io) = &self.midi_io {
+            io.set_filter(filter);
+        }
+    }
+
+    /// Forces the control-surface input port by exact name (`None` returns to the device filter).
+    pub fn control_surface_port(&mut self, port: Option<String>) {
+        let mut port = port.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+        if port.as_deref().is_some_and(|surface| self.msc.keyboard_port.as_deref() == Some(surface)) {
+            if let Some(port) = port.as_deref() {
+                log::warn!("MIDI: `{port}` is selected as a keyboard; it cannot also be the control surface");
+            }
+            port = None;
+        }
+        self.msc.surface_port = port.clone();
+        self.ui.msc.surface_port = port.clone();
+        if let Some(io) = &self.midi_io {
+            io.set_surface_port(port);
+        }
+    }
+
+    /// Turns the Bluetooth (BLE-MIDI) link for the control surface on or off. Persisted.
+    pub fn control_surface_ble(&mut self, on: bool) {
+        self.msc.ble = on;
+        self.ui.msc.ble = on;
+        if let Some(io) = &self.midi_io {
+            io.set_ble(on);
+        }
+    }
+
+    /// Selects the hardware MIDI keyboard (by exact port name); `None` disconnects it. Persisted.
+    pub fn control_surface_keyboard(&mut self, port: Option<String>) {
+        let port = port.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+        if port.as_deref().is_some_and(|keyboard| self.msc.surface_port.as_deref() == Some(keyboard)) {
+            if let Some(port) = self.msc.surface_port.take() {
+                log::warn!("MIDI: `{port}` is selected as a control surface; clearing that role to connect the keyboard");
+            }
+            self.ui.msc.surface_port = None;
+            if let Some(io) = &self.midi_io {
+                io.set_surface_port(None);
+            }
+        }
+        self.msc.keyboard_port = port.clone();
+        self.ui.msc.keyboard_port = port.clone();
+        if let Some(io) = &self.midi_io {
+            io.set_keyboard_port(port);
+        }
+    }
+
+    /// Moves input messages into the mixer, status into the UI and feedback to the device.
+    /// Bounded per frame, so a broken device cannot stall a repaint.
+    fn pump_control_surface(&mut self) {
+        let was_connected = self.msc.connected;
+        let mut inbound: Vec<midi_io::InMessage> = Vec::new();
+        let status = match &self.midi_io {
+            Some(io) => {
+                for _ in 0..midi_io::MAX_IN_PER_FRAME {
+                    let Some(msg) = io.recv() else { break };
+                    inbound.push(msg);
+                }
+                io.status()
+            }
+            None => self.msc.link.clone(),
+        };
+        for msg in &inbound {
+            let source = match msg.source {
+                midi_io::Source::Surface => "SURFACE",
+                midi_io::Source::Keyboard => "KEYBOARD",
+            };
+            let now = self.last_frame.unwrap_or_default();
+            self.msc.note_input(source, msg.data, now);
+            match msg.source {
+                midi_io::Source::Surface => {
+                    let handled = self.handle_msc_midi(&msg.data);
+                    self.log_surface(msg.data, handled.as_deref(), now);
+                    // Every surface message shows in the status bar: moving a fader there is the
+                    // fastest way to see that the hardware is reaching the mixer.
+                    if let Some(text) = handled {
+                        self.ui.status = text;
+                    }
+                }
+                // A MIDI keyboard (a piano, a controller) plays the selected instrument track and
+                // lights the on-screen keys.
+                // Already played by the MIDI worker (see `sync_live_midi`): only light the keys.
+                midi_io::Source::Keyboard if msg.played => self.light_keys(msg.data),
+                midi_io::Source::Keyboard => self.play_live_note(msg.data),
+            }
+        }
+        self.msc.apply_link_status(status.clone());
+        if self.msc.connected && !was_connected {
+            self.log_surface_map();
+        }
+        // A saved keyboard port that is no longer among the readable ports (unplugged, or the
+        // ALSA "Midi Through" dummy an older build picked) is dropped so the auto-pick can run.
+        if let Some(chosen) = self.msc.keyboard_port.clone()
+            && !status.ports.is_empty()
+            && !status.ports.iter().any(|p| p.name == chosen)
+        {
+            log::debug!("MIDI: saved keyboard port `{chosen}` is not present any more; forgetting it");
+            self.control_surface_keyboard(None);
+            self.auto_keyboard_done = false;
+        }
+        // Playing the piano should need no clicking: the first time a readable MIDI port appears
+        // and nothing has ever been chosen, attach the piano-like one.
+        if !self.auto_keyboard_done && self.msc.keyboard_port.is_none() && !status.ports.is_empty() {
+            let pick = status
+                .ports
+                .iter()
+                .find(|p| {
+                    !p.matched
+                        && ["casio", "cdp", "piano", "keyboard", "yamaha", "roland", "kawai", "nord", "arturia", "midi"]
+                            .iter()
+                            .any(|a| p.name.to_ascii_lowercase().contains(a))
+                })
+                .map(|p| p.name.clone());
+            if let Some(name) = pick {
+                // Only latch once a keyboard was really found: if none is plugged in yet, the
+                // pick runs again on a later frame (hot-plug).
+                self.auto_keyboard_done = true;
+                log::info!("auto-connecting the MIDI keyboard `{name}`");
+                self.control_surface_keyboard(Some(name));
+                self.control_surface_rescan();
+            }
+        }
+        let feedback = self.msc.drain_output();
+        if let Some(io) = &self.midi_io {
+            for packet in feedback {
+                io.send(packet);
+            }
+        }
+    }
+
+    /// Writes control-surface input to the log file: one line per message, throttled to a
+    /// readable sample, so "the controller sends nothing" and "the mapping ignores it" can be
+    /// told apart from the log alone.
+    fn log_surface(&mut self, data: [u8; 3], handled: Option<&str>, now: f64) {
+        let text = match handled {
+            Some(text) => text.to_string(),
+            None => "(unmapped)".to_string(),
+        };
+        let quiet = self.msc_log.as_ref().is_none_or(|(at, last)| now - at >= 0.2 || *last != text);
+        if quiet {
+            log::info!("MCU in [{:02X} {:02X} {:02X}] -> {text}", data[0], data[1], data[2]);
+            self.msc_log = Some((now, text));
+        }
+    }
+
+    /// Logs which track each physical fader drives, so a bank misalignment is visible in the log.
+    fn log_surface_map(&self) {
+        let session = self.engine.session();
+        let mut parts = Vec::new();
+        for channel in 0..self.msc.config.channels {
+            let Some(tid) = self.msc.track_for_channel(session, channel) else { continue };
+            let Some(track) = session.track(tid) else { continue };
+            parts.push(format!("{}={} ({:.1} dB)", channel + 1, track.name, track.mixer.volume_db));
+        }
+        log::info!(
+            "MCU: surface `{}` attached; faders drive bank {} -> {}",
+            self.msc.port_name,
+            self.msc.active_bank + 1,
+            if parts.is_empty() { "no tracks".to_string() } else { parts.join(", ") }
+        );
     }
 
     fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
@@ -1050,7 +1428,20 @@ impl SoundApp {
                     self.play_from_selection();
                 }
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
-                TransportRequest::AllNotesOff => {}
+                TransportRequest::AllNotesOff => {
+                    // This used to do nothing at all. A note started inside a plugin's own GUI
+                    // keyboard never passes through this host, so the only way to stop it is to
+                    // send the silence messages to every instrument.
+                    if let Some(player) = &self.player {
+                        player.panic_all_notes();
+                    }
+                    self.keyboard.held_notes.clear();
+                    self.keyboard.typed_notes.clear();
+                    self.keyboard.last_clicked = None;
+                    self.keyboard.last_clicked_track = None;
+                    self.ui.status = "All MIDI notes off".to_string();
+                    log::info!("panic: all notes off");
+                }
             }
         }
         // Read back the position.
@@ -1122,15 +1513,25 @@ impl SoundApp {
                 ctx.request_repaint();
             }
         }
-        let light = theme::wants_light(ctx, self.ui.theme);
-        if self.theme_applied != Some(light) || theme::is_light() != light {
-            theme::apply(ctx, light);
-            self.theme_applied = Some(light);
+        let mode = self.ui.theme;
+        let sys_light = ctx.system_theme() == Some(egui::Theme::Light);
+        let needs_apply = match self.theme_applied {
+            None => true,
+            Some(theme::ThemeMode::System) => mode != theme::ThemeMode::System || theme::is_light() != sys_light,
+            Some(prev) => prev != mode,
+        };
+        if needs_apply {
+            theme::apply_mode(ctx, mode);
+            self.theme_applied = Some(mode);
         }
         let now = ctx.input(|i| i.time);
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
+        // The instrument console follows the selected instrument (and never silences another one).
+        crate::console_kit::follow_selection(self);
+        // A note the virtual keyboard started must never outlive the key that started it.
+        crate::virtual_keyboard::release_orphan_notes(self, ctx);
         self.note_recent_session();
         self.apply_editor_edits();
         bounce::step(self, ctx);
@@ -1154,6 +1555,84 @@ impl SoundApp {
             }
         }
         self.autosave_changes();
+        // A scan that just finished may now know the bundle paths of plugins a session asked for;
+        // retry their instances (the probe decides whether each one is safe to load in-process).
+        let scanning = crate::fx_browser::is_scanning();
+        if self.was_scanning && !scanning {
+            // The catalogue may know bundles it did not a minute ago, and a plugin that crashed before
+            // can load now (a yabridge sync, a repaired Wine prefix, the missing DLL folder): forget the
+            // old verdicts so every slot that never loaded is probed again.
+            soundcraft_playback::reset_probes();
+            if let Some(p) = &self.player {
+                p.retry_unloaded_plugins(self.engine.session_arc());
+            }
+            log::info!("plugin catalogue updated; retrying plugin instances");
+        }
+        self.was_scanning = scanning;
+        // A session asking for a plugin the catalogue has no bundle for means an interrupted scan (a
+        // crashing DLL takes the child down, and everything after it is missing) or a first launch that
+        // never got one: run one pass over the configured folders so those ids resolve.
+        if !scanning
+            && !soundcraft_playback::plugins_awaiting_catalogue().is_empty()
+            && self.catalogue_retry_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60))
+        {
+            self.catalogue_retry_at = Some(std::time::Instant::now());
+            crate::fx_browser::spawn_async_sync(None, false);
+        }
+        // A third-party plugin that just finished validation in a child process can now be loaded:
+        // re-send the session so it comes up without the user inserting it again.
+        let probes = soundcraft_playback::probes_changed();
+        if probes != self.probes_seen {
+            self.probes_seen = probes;
+            if let Some(p) = &self.player {
+                p.update_session(self.engine.session_arc());
+            }
+        }
+        if self.pending_gui.is_some() || soundcraft_playback::probes_changed() != self.probes_seen {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if let Some((t_id, slot)) = self.pending_gui {
+            self.pending_gui_frames += 1;
+            if self.pending_gui_frames > 600 {
+                self.pending_gui = None;
+                self.pending_gui_frames = 0;
+                // Say why nothing opened rather than leaving the click unanswered: the plugin is still
+                // being created (or never made it past validation), so there is no window to show yet.
+                let why = if self.was_scanning {
+                    "the plugin catalogue is still scanning"
+                } else {
+                    "the instrument has not loaded yet — its validation child has not answered"
+                };
+                self.ui.status = format!("Plugin window did not open: {why}");
+            } else if let Some(p) = &self.player {
+                if p.has_editor(t_id, slot) {
+                    self.pending_gui_frames = 0;
+                    match p.open_editor(t_id, slot) {
+                        Ok(()) => {
+                            self.pending_gui = None;
+                            self.ui.status = "Plugin window opened".to_string();
+                        }
+                        Err(e) => {
+                            self.pending_gui = None;
+                            log::warn!("Could not open plugin editor: {e}");
+                            self.ui.status = format!("Plugin window: {e}");
+                        }
+                    }
+                } else {
+                    let unav = p.plugin_load_status();
+                    if unav.iter().any(|(t, s, _, st)| *t == t_id && *s == slot && *st == soundcraft_playback::ProbeState::Refused) {
+                        self.pending_gui = None;
+                        self.pending_gui_frames = 0;
+                        self.ui.status = "Plugin validation failed; could not open editor".to_string();
+                    }
+                }
+            }
+        } else {
+            self.pending_gui_frames = 0;
+        }
+        self.msc.sync_feedback(self.engine.session(), self.is_playing(), self.engine.transport.recording, &self.meters);
+        self.pump_control_surface();
+        self.sync_live_midi(ctx);
         self.write_automation(ctx);
         self.autosave();
         if self.recorder.is_none()
@@ -1230,6 +1709,7 @@ impl SoundApp {
         }
         panels::floating(self, &ctx);
         windows::show(self, &ctx);
+        console_kit::show(self, &ctx);
         video_window::show(self, &ctx);
         ops_windows::show(self, &ctx);
         extra_windows::show(self, &ctx);
@@ -1304,6 +1784,21 @@ fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usi
 mod tests {
     use super::{Services, SoundApp, automation_step_due};
     use serde_json::json;
+
+    #[test]
+    fn midi_keyboard_port_cannot_remain_selected_as_the_control_surface() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        app.msc.keyboard_port = Some("CASIO USB-MIDI MIDI 1".to_string());
+        app.msc.surface_port = Some("CASIO USB-MIDI MIDI 1".to_string());
+        app.ui.msc.keyboard_port = app.msc.keyboard_port.clone();
+        app.ui.msc.surface_port = app.msc.surface_port.clone();
+
+        app.start_control_surface("SMC-Mixer");
+
+        assert_eq!(app.msc.surface_port, None);
+        assert_eq!(app.ui.msc.surface_port, None);
+        assert_eq!(app.msc.keyboard_port.as_deref(), Some("CASIO USB-MIDI MIDI 1"));
+    }
 
     #[test]
     fn new_session_stops_playback_and_the_old_clock() {

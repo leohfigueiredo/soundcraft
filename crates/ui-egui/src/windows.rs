@@ -2,7 +2,7 @@
 
 use crate::SoundApp;
 use crate::theme::{Tokens, mono, rgb};
-use egui::{Color32, Sense, vec2};
+use egui::{Sense, vec2};
 use serde_json::json;
 use soundcraft_model::{AutomationMode, ClipContent};
 use soundcraft_playback::AudioConfig;
@@ -25,6 +25,11 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     io_setup(app, ctx);
     shortcuts_window(app, ctx);
     clip_effects(app, ctx);
+    msc_hardware(app, ctx);
+    midi_monitor(app, ctx);
+    midi_devices(app, ctx);
+    crate::fx_browser::show(app, ctx);
+    crate::fx_browser::show_vst_paths_window(app, ctx);
 }
 
 fn audio_health(app: &mut SoundApp, ctx: &egui::Context) {
@@ -266,54 +271,8 @@ fn event_list(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.show_event_list = open;
 }
 
-fn midi_keyboard(app: &mut SoundApp, ctx: &egui::Context) {
-    let mut open = app.ui.show_midi_keyboard;
-    win(ctx, &mut open, "MIDI Keyboard", vec2(640.0, 110.0), |ui| {
-        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(400.0), 80.0), Sense::click());
-        let whites = 28;
-        let w = r.width() / whites as f32;
-        let mut wi = 0;
-        let base = 48u8;
-        let mut clicked: Option<u8> = None;
-        let pos = resp.interact_pointer_pos();
-        for p in base..base + 48 {
-            if !matches!(p % 12, 1 | 3 | 6 | 8 | 10) {
-                let kr = egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w, r.min.y), vec2(w - 1.0, r.height()));
-                ui.painter().rect_filled(kr, 2.0, Color32::from_rgb(235, 235, 235));
-                if resp.clicked() && pos.is_some_and(|q| kr.contains(q)) {
-                    clicked = Some(p);
-                }
-                wi += 1;
-            }
-        }
-        wi = 0;
-        for p in base..base + 48 {
-            if matches!(p % 12, 1 | 3 | 6 | 8 | 10) {
-                let kr = egui::Rect::from_min_size(egui::pos2(r.min.x + wi as f32 * w - w * 0.3, r.min.y), vec2(w * 0.6, r.height() * 0.6));
-                ui.painter().rect_filled(kr, 2.0, Color32::from_rgb(20, 20, 20));
-                if resp.clicked() && pos.is_some_and(|q| kr.contains(q)) {
-                    clicked = Some(p);
-                }
-            } else {
-                wi += 1;
-            }
-        }
-        if let Some(p) = clicked
-            && let Some(cid) = crate::midi_editor::target_clip(app)
-        {
-            // Step input: add the note at the insertion point (relative to the clip) and advance.
-            let s = app.engine.session();
-            let (clip_start, at) = (s.find_clip(cid).map_or(0, |(_, c)| c.start), s.edit.selection.start);
-            let rel = s.tempo.samples_to_ticks(at, s.sample_rate) - s.tempo.samples_to_ticks(clip_start, s.sample_rate);
-            let len = soundcraft_time::TICKS_PER_QUARTER / 2;
-            let _ = app.run("midi.note_add", json!({"clip": cid.0, "pitch": p, "start_ticks": rel.max(0), "length_ticks": len}));
-            let s = app.engine.session();
-            let next = s.tempo.tick_to_samples(s.tempo.samples_to_ticks(at, s.sample_rate) + len, s.sample_rate);
-            let _ = app.run("transport.locate", json!({"at": next}));
-        }
-        ui.label(egui::RichText::new("Click keys to step-enter notes into the selected MIDI clip at the insertion point.").small());
-    });
-    app.ui.show_midi_keyboard = open;
+fn midi_keyboard(_app: &mut SoundApp, _ctx: &egui::Context) {
+    // The horizontal virtual piano keyboard is integrated into the bottom dock of the Edit window.
 }
 
 fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
@@ -528,6 +487,9 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
                 }
             }));
             ui.end_row();
+            ui.label("Audio thread");
+            ui.label(app.player.as_ref().map_or("none".to_string(), |p| p.realtime().describe()));
+            ui.end_row();
             ui.label("Input");
             ui.label(app.recorder.as_ref().map_or("opened on first record or monitor".to_string(), |r| {
                 format!("{} · {} Hz · {} ch", r.device_name, r.sample_rate, r.channels)
@@ -596,7 +558,7 @@ pub fn audio_device_command(app: &mut SoundApp, p: &serde_json::Value) -> Result
         app.apply_audio_config(cfg)?;
     }
     let device = app.player.as_ref().map(|pl| {
-        json!({"name": pl.device_name, "sample_rate": pl.device_rate, "channels": pl.device_channels, "buffer_size": pl.device_buffer, "silent": pl.silent})
+        json!({"name": pl.device_name, "sample_rate": pl.device_rate, "channels": pl.device_channels, "buffer_size": pl.device_buffer, "silent": pl.silent, "audio_thread": pl.realtime().describe()})
     });
     let mut out = json!({"config": app.ui.audio, "device": device});
     if p.get("list").and_then(Value::as_bool).unwrap_or(false) {
@@ -739,6 +701,556 @@ pub fn clip_effects(app: &mut SoundApp, ctx: &egui::Context) {
         });
     });
     app.ui.show_clip_effects = open;
+}
+
+/// MIDI Devices: the Reaper-like device list. Every readable MIDI port with two assignments —
+/// `Input` (notes to the selected instrument track) and `Control` (faders/buttons as the control
+/// surface) — plus a live activity light.
+pub fn midi_devices(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_midi_devices;
+    let t = Tokens::current();
+    win(ctx, &mut open, "MIDI Devices", vec2(640.0, 430.0), |ui| {
+        use crate::midi_io::LinkState;
+        ui.horizontal(|ui| {
+            let (dot, col) = match app.msc.link.state {
+                LinkState::Connected => ("●", egui::Color32::from_rgb(0, 220, 130)),
+                LinkState::Searching => ("◐", t.meter_yellow),
+                LinkState::Unavailable => ("○", t.meter_red),
+            };
+            ui.label(egui::RichText::new(format!("{dot} sequencer {}", app.msc.link.state.label())).color(col));
+            ui.label(egui::RichText::new(&app.msc.link.backend).small().color(t.text_dim));
+            if ui.small_button("Rescan").clicked() {
+                app.control_surface_rescan();
+            }
+            if ui.small_button("MIDI Monitor").clicked() {
+                app.ui.show_midi_monitor = true;
+            }
+            if ui.small_button("Bluetooth (BLE)").clicked() {
+                let on = !app.msc.ble;
+                app.control_surface_ble(on);
+            }
+            if app.msc.ble {
+                ui.label(egui::RichText::new("BLE on").small().color(t.accent));
+            }
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("Enable each device the way Reaper does: Input = notes, Control = faders/buttons.").small().color(t.text_dim));
+        let ports = app.msc.link.ports.clone();
+        let now = ui.input(|i| i.time);
+        let flash = app.msc.input_active(now, 0.6);
+        let keyboard = app.msc.keyboard_port.clone();
+        let surface = app.msc.surface_port();
+        if ports.is_empty() {
+            ui.label(
+                egui::RichText::new("No MIDI ports. Check: /dev/snd/seq exists, user in the 'audio' group, device on USB.").color(t.meter_yellow),
+            );
+        }
+        egui::ScrollArea::vertical().id_salt("midi_devices_list").show(ui, |ui| {
+            for port in &ports {
+                ui.horizontal(|ui| {
+                    let dot = if flash { "●" } else { "○" };
+                    ui.label(egui::RichText::new(dot).color(if flash { t.accent } else { t.text_dim }));
+                    let name_r = egui::RichText::new(&port.name).monospace();
+                    ui.label(if port.matched { name_r.color(t.accent) } else { name_r });
+                    ui.label(egui::RichText::new(&port.address).small().color(t.text_dim));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let is_surface = surface.as_deref() == Some(port.name.as_str());
+                        let is_keyboard = keyboard.as_deref() == Some(port.name.as_str());
+                        if ui.selectable_label(is_surface, "Control").on_hover_text("Use this port for the faders/buttons").clicked() {
+                            if is_surface {
+                                app.control_surface_port(None);
+                            } else {
+                                app.control_surface_port(Some(port.name.clone()));
+                            }
+                            app.control_surface_rescan();
+                        }
+                        if ui
+                            .selectable_label(is_keyboard, "Input")
+                            .on_hover_text("Use this port for notes (the selected instrument track)")
+                            .clicked()
+                        {
+                            if is_keyboard {
+                                app.control_surface_keyboard(None);
+                            } else {
+                                app.control_surface_keyboard(Some(port.name.clone()));
+                            }
+                            app.control_surface_rescan();
+                        }
+                    });
+                });
+            }
+        });
+        ui.separator();
+        if !app.msc.link.ports.is_empty() && app.msc.link.received == 0 {
+            ui.label(egui::RichText::new("Ports found but no message received yet: is the device in DAW/MCU mode?").small().color(t.meter_yellow));
+        }
+    });
+    app.ui.show_midi_devices = open;
+}
+
+/// MIDI Monitor: every port the worker sees, what is subscribed, and the message log. This is
+/// the window that answers "is the controller sending anything?".
+pub fn midi_monitor(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_midi_monitor;
+    let t = Tokens::current();
+    win(ctx, &mut open, "MIDI Monitor", vec2(620.0, 460.0), |ui| {
+        use crate::midi_io::LinkState;
+        let link = app.msc.link.clone();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Sequencer:").strong());
+            let (dot, col) = match link.state {
+                LinkState::Connected => ("●", egui::Color32::from_rgb(0, 220, 130)),
+                LinkState::Searching => ("◐", t.meter_yellow),
+                LinkState::Unavailable => ("○", t.meter_red),
+            };
+            ui.label(egui::RichText::new(format!("{dot} {}", link.state.label())).color(col));
+            ui.label(egui::RichText::new(&link.backend).color(t.text_dim));
+            if !link.message.is_empty() {
+                ui.label(egui::RichText::new(&link.message).italics().color(t.meter_yellow));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!("Surface: {}", if link.port_name.is_empty() { "—" } else { &link.port_name }));
+            ui.separator();
+            ui.label(format!("Keyboard: {}", app.msc.keyboard_port.as_deref().unwrap_or("—")));
+            ui.separator();
+            let (kdot, kcol) = match link.keyboard_state {
+                LinkState::Connected => ("●", egui::Color32::from_rgb(0, 220, 130)),
+                LinkState::Searching => ("◐", t.meter_yellow),
+                LinkState::Unavailable => ("○", t.text_dim),
+            };
+            ui.label(egui::RichText::new(format!("{kdot} {}", link.keyboard_state.label())).color(kcol));
+            ui.separator();
+            let (bdot, bcol) = match link.ble_state {
+                LinkState::Connected => ("●", egui::Color32::from_rgb(0, 220, 130)),
+                LinkState::Searching => ("◐", t.meter_yellow),
+                LinkState::Unavailable => ("○", t.text_dim),
+            };
+            ui.label(egui::RichText::new(format!("{bdot} BLE: {}", if link.ble_device.is_empty() { "—" } else { &link.ble_device })).color(bcol));
+            ui.separator();
+            ui.label(egui::RichText::new(format!("rx {} · tx {}", link.received, link.sent)).monospace().color(t.text_dim));
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("Input ports (click one to use it as the keyboard)").small().color(t.text_dim));
+        let ports = link.ports.clone();
+        let current = app.msc.keyboard_port.clone();
+        egui::ScrollArea::vertical().max_height(120.0).id_salt("midi_monitor_ports").show(ui, |ui| {
+            if ports.is_empty() {
+                ui.label(egui::RichText::new("No readable MIDI ports. Is the sequencer running? (ls /dev/snd/seq)").color(t.meter_yellow));
+            }
+            for port in &ports {
+                ui.horizontal(|ui| {
+                    let is_keyboard = current.as_deref() == Some(port.name.as_str());
+                    let label = if port.matched { format!("🎛 {}", port.name) } else { format!("🎹 {}", port.name) };
+                    if ui.selectable_label(is_keyboard, egui::RichText::new(label).small()).on_hover_text(&port.address).clicked() {
+                        if is_keyboard {
+                            app.control_surface_keyboard(None);
+                        } else {
+                            app.control_surface_keyboard(Some(port.name.clone()));
+                        }
+                        app.control_surface_rescan();
+                    }
+                    if ui.small_button("as surface").on_hover_text("Use this port for the faders/buttons").clicked() {
+                        app.control_surface_port(Some(port.name.clone()));
+                        app.control_surface_rescan();
+                    }
+                });
+            }
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("Last messages").small().color(t.text_dim));
+        egui::ScrollArea::vertical().max_height(180.0).id_salt("midi_monitor_log").show(ui, |ui| {
+            let mut lines: Vec<(String, String)> = app
+                .msc
+                .recent_input
+                .iter()
+                .map(|(source, m)| (source.clone(), format!("{:02X} {:02X} {:02X}  {}", m[0], m[1], m[2], crate::midi_io::describe(*m))))
+                .collect();
+            lines.reverse();
+            if lines.is_empty() {
+                ui.label(egui::RichText::new("Nothing received yet. Move a fader or press a button on the controller.").italics().color(t.text_dim));
+            }
+            for (source, text) in lines {
+                let col = if source == "KEYBOARD" { t.meter_yellow } else { t.accent };
+                ui.label(egui::RichText::new(format!("{source:8} {text}")).monospace().small().color(col));
+            }
+        });
+        if !link.ports.is_empty() && link.received == 0 {
+            ui.label(
+                egui::RichText::new(
+                    "Ports exist but no message arrived: check that the controller is in MCU mode and its OUT port is the one subscribed.",
+                )
+                .small()
+                .color(t.meter_yellow),
+            );
+        }
+    });
+    app.ui.show_midi_monitor = open;
+}
+
+/// Hardware Controller & Mackie Control Universal Setup window (iCON P1-M & M-Vave SMC).
+pub fn msc_hardware(app: &mut SoundApp, ctx: &egui::Context) {
+    let mut open = app.ui.show_msc_hardware;
+    let t = Tokens::current();
+    win(ctx, &mut open, "DAW Controller & Mackie Control Setup (iCON P1-M)", vec2(660.0, 520.0), |ui| {
+        // Hardware Profile Switcher
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Hardware Profile:").strong());
+            let is_p1m = app.msc.config.profile == crate::msc_mixer::ControllerProfile::IconP1M;
+            if ui.selectable_label(is_p1m, "🎛 iCON P1-M (motorized 100 mm, display, 12-LED meters)").clicked() {
+                app.msc.config = crate::msc_mixer::MscConfig::icon_p1m();
+                app.msc.reset_pickups();
+            }
+            let is_smc = app.msc.config.profile == crate::msc_mixer::ControllerProfile::MVaveSmc;
+            if ui.selectable_label(is_smc, "🎛 M-Vave SMC-Mixer (USB-MIDI / Bluetooth BLE)").clicked() {
+                app.msc.config = crate::msc_mixer::MscConfig::mvave_smc();
+                app.msc.reset_pickups();
+            }
+        });
+
+        ui.separator();
+
+        // MIDI keyboard (a piano, a controller): notes go to the selected instrument track.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("MIDI keyboard:").strong());
+            let state = app.msc.link.keyboard_state;
+            let (dot, color) = match state {
+                crate::midi_io::LinkState::Connected => ("●", egui::Color32::from_rgb(0, 220, 130)),
+                crate::midi_io::LinkState::Searching => ("◐", t.meter_yellow),
+                crate::midi_io::LinkState::Unavailable => ("○", t.meter_red),
+            };
+            let current = app.msc.keyboard_port.clone().unwrap_or_else(|| "not connected".to_string());
+            ui.label(egui::RichText::new(format!("{dot} {current}")).color(color));
+            if ui.small_button("Auto-connect piano").on_hover_text("Pick the first piano-like MIDI port (Casio, Yamaha, Roland…)").clicked() {
+                let _ = app.run("controller.keyboard_auto", json!({}));
+            }
+            if app.msc.keyboard_port.is_some() && ui.small_button("Disconnect").clicked() {
+                app.control_surface_keyboard(None);
+                app.control_surface_rescan();
+            }
+        });
+        // Every readable MIDI port: click one to use it as the keyboard.
+        if !app.msc.link.ports.is_empty() {
+            let ports = app.msc.link.ports.clone();
+            let current = app.msc.keyboard_port.clone();
+            ui.horizontal_wrapped(|ui| {
+                for p in &ports {
+                    let is_current = current.as_deref() == Some(p.name.as_str());
+                    let label = if p.matched { format!("🎛 {}", p.name) } else { format!("🎹 {}", p.name) };
+                    if ui.selectable_label(is_current, egui::RichText::new(label).small()).on_hover_text(&p.address).clicked() {
+                        if is_current {
+                            app.control_surface_keyboard(None);
+                        } else {
+                            app.control_surface_keyboard(Some(p.name.clone()));
+                        }
+                        app.control_surface_rescan();
+                    }
+                }
+            });
+        }
+        if let Some(target) = crate::virtual_keyboard::active_target_track(app) {
+            if let Some(track) = app.engine.session().track(target) {
+                if track.instrument.is_some() {
+                    ui.label(egui::RichText::new(format!("Notes play the selected track: {}", track.name)).small().color(t.text_dim));
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("{} has no instrument loaded; add an instrument to hear MIDI notes.", track.name))
+                            .small()
+                            .color(t.meter_yellow),
+                    );
+                }
+            }
+        } else {
+            ui.label(egui::RichText::new("Create an instrument track to play incoming MIDI notes.").small().color(t.meter_yellow));
+        }
+        // Input monitor: exactly what arrives from the hardware, so a dead fader or keyboard is
+        // visible instead of guessed.
+        if !app.msc.recent_input.is_empty() {
+            let lines: Vec<String> =
+                app.msc.recent_input.iter().map(|(source, d)| format!("{source:8} {:02X} {:02X} {:02X}", d[0], d[1], d[2])).collect();
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Last MIDI input").small().color(t.text_dim));
+                for line in lines {
+                    ui.label(egui::RichText::new(line).monospace().small());
+                }
+            });
+        }
+
+        // Live MIDI link: what the ALSA sequencer worker actually sees (hot-plug aware).
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("MIDI link:").strong());
+            let (dot, color) = match app.msc.link.state {
+                crate::midi_io::LinkState::Connected => ("●", egui::Color32::from_rgb(0, 220, 130)),
+                crate::midi_io::LinkState::Searching => ("◐", t.meter_yellow),
+                crate::midi_io::LinkState::Unavailable => ("○", t.meter_red),
+            };
+            ui.label(egui::RichText::new(format!("{dot} {}", app.msc.link.state.label())).color(color).strong());
+            ui.separator();
+            ui.label(egui::RichText::new(&app.msc.link.backend).color(t.text_dim));
+            if !app.msc.link.port_name.is_empty() {
+                ui.separator();
+                ui.label(egui::RichText::new(&app.msc.link.port_name).monospace());
+            }
+            if ui.small_button("🔄 Rescan").on_hover_text("Re-read the MIDI port list now (hot-plug)").clicked() {
+                app.control_surface_rescan();
+            }
+            if ui.small_button("📡 MIDI Monitor").on_hover_text("Every port, what is subscribed, and the live message log").clicked() {
+                app.ui.show_midi_monitor = true;
+            }
+            if ui.small_button("🎹 MIDI Devices").on_hover_text("Enable each device for notes or for faders/buttons (Reaper-style)").clicked() {
+                app.ui.show_midi_devices = true;
+            }
+            if ui.small_button("🎛 Connect").on_hover_text("Start the control-surface link if it is not running").clicked() {
+                app.start_control_surface(app.msc.config.bluetooth_device_name_filter.clone());
+                app.control_surface_rescan();
+            }
+        });
+        if !app.msc.link.message.is_empty() {
+            ui.label(egui::RichText::new(&app.msc.link.message).italics().color(t.text_dim));
+        }
+        if app.msc.link.state == crate::midi_io::LinkState::Unavailable && app.msc.link.ble_state != crate::midi_io::LinkState::Connected {
+            let hint = "No ALSA MIDI link: check /dev/snd/seq and its permissions. Pair the SMC-Mixer, then enable \
+                        Bluetooth (BLE-MIDI) for the built-in BlueZ connection. The SMC-Mixer controls the mixer; \
+                        use a MIDI keyboard and an instrument track to play notes.";
+            ui.label(egui::RichText::new(hint).small().color(t.meter_yellow));
+        }
+        ui.horizontal(|ui| {
+            ui.label("Device filter:");
+            let mut filter = app.msc.link.filter.clone();
+            if ui.add(egui::TextEdit::singleline(&mut filter).desired_width(160.0)).changed() {
+                app.control_surface_filter(filter.clone());
+                app.msc.config.bluetooth_device_name_filter = filter;
+            }
+            ui.separator();
+            let counters = format!("rx {} · tx {} · resyncs {}", app.msc.link.received, app.msc.link.sent, app.msc.link.reconnects);
+            let counters = egui::RichText::new(counters);
+            ui.label(counters.monospace().color(t.text_dim));
+        });
+        if !app.msc.link.ports.is_empty() {
+            let ports = app.msc.link.ports.clone();
+            ui.group(|ui| {
+                egui::ScrollArea::vertical().max_height(70.0).show(ui, |ui| {
+                    for port in &ports {
+                        ui.horizontal(|ui| {
+                            let mark = if port.matched { "★" } else { "·" };
+                            ui.label(egui::RichText::new(format!("{mark} {}", port.name)).monospace());
+                            ui.label(egui::RichText::new(&port.address).monospace().color(t.text_dim));
+                        });
+                    }
+                });
+            });
+        }
+
+        ui.horizontal(|ui| {
+            let mut ble = app.msc.ble;
+            if ui
+                .checkbox(&mut ble, "Bluetooth (BLE-MIDI)")
+                .on_hover_text("Use the paired SMC-Mixer over Bluetooth LE: BlueZ GATT + BLE-MIDI packets")
+                .changed()
+            {
+                app.control_surface_ble(ble);
+            }
+            let (dot, colour) = match app.msc.link.ble_state {
+                crate::midi_io::LinkState::Connected => ("●", egui::Color32::from_rgb(0, 220, 130)),
+                crate::midi_io::LinkState::Searching => ("◐", t.meter_yellow),
+                crate::midi_io::LinkState::Unavailable => ("○", t.text_dim),
+            };
+            let name = if app.msc.link.ble_device.is_empty() { "no BLE device".to_string() } else { app.msc.link.ble_device.clone() };
+            ui.label(egui::RichText::new(format!("{dot} BLE: {name}")).small().color(colour));
+            ui.separator();
+            ui.label(egui::RichText::new("Control mode:").strong());
+            for mode in [crate::msc_mixer::MscMode::Global, crate::msc_mixer::MscMode::Linked] {
+                if ui.selectable_label(app.msc.mode == mode, mode.label()).clicked() {
+                    app.msc.mode = mode;
+                    app.msc.reset_pickups();
+                }
+            }
+            ui.separator();
+            ui.checkbox(&mut app.msc.config.soft_takeover, "Soft takeover (fader pickup)")
+                .on_hover_text("A physical fader only moves its track after reaching the track's current value");
+            if ui.small_button("Release pickups").on_hover_text("Make every fader re-acquire its track").clicked() {
+                app.msc.reset_pickups();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("MIDI Learn:").strong());
+            match &app.msc.learn {
+                Some(target) => {
+                    ui.label(egui::RichText::new(format!("armed for {} — move a knob/fader/press a button", target.describe())).color(t.accent));
+                    if ui.small_button("Cancel").clicked() {
+                        app.msc.learn_cancel();
+                    }
+                }
+                None => {
+                    let sel = app.engine.session().edit.selected_tracks.first().copied();
+                    if let Some(tid) = sel {
+                        if ui.small_button("Learn volume").clicked() {
+                            app.msc.learn_start(crate::msc_mixer::LearnTarget::Volume { track: tid.0 });
+                        }
+                        if ui.small_button("Learn pan").clicked() {
+                            app.msc.learn_start(crate::msc_mixer::LearnTarget::Pan { track: tid.0, index: 0 });
+                        }
+                    }
+                    let n = app.msc.bindings.len();
+                    ui.label(egui::RichText::new(format!("{n} learned control(s)")).color(t.text_dim));
+                    if n > 0 && ui.small_button("Clear all").clicked() {
+                        app.msc.learn_clear(None);
+                    }
+                }
+            }
+        });
+        if !app.msc.bindings.is_empty() {
+            let bindings = app.msc.bindings.clone();
+            ui.group(|ui| {
+                egui::ScrollArea::vertical().max_height(64.0).show(ui, |ui| {
+                    for (i, b) in bindings.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("{} → {}", b.describe(), b.target.describe())).monospace());
+                            if ui.small_button("✖").on_hover_text("Unlearn").clicked() {
+                                app.msc.bindings.remove(i);
+                            }
+                        });
+                    }
+                });
+            });
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Protocol:").strong());
+            ui.label(egui::RichText::new(&app.msc.config.protocol).color(t.accent));
+            ui.separator();
+            ui.label(format!("Bank: {} (tracks {}–{})", app.msc.active_bank + 1, app.msc.active_bank * 8 + 1, (app.msc.active_bank + 1) * 8));
+            if ui.small_button("◀ Prev Bank").clicked() && app.msc.active_bank > 0 {
+                app.msc.active_bank -= 1;
+            }
+            if ui.small_button("Next Bank ▶").clicked() && app.msc.active_bank < 8 {
+                app.msc.active_bank += 1;
+            }
+            ui.separator();
+            let flip_txt = if app.msc.faders_flipped { "FLIPPED (Faders=Pan)" } else { "NORMAL (Faders=Vol)" };
+            let flip_col = if app.msc.faders_flipped { t.meter_yellow } else { t.text_dim };
+            ui.label(egui::RichText::new(format!("Flip: {flip_txt}")).color(flip_col));
+            ui.separator();
+            let scrub_txt = if app.msc.scrub_active { "SCRUB ON" } else { "JOG" };
+            let scrub_col = if app.msc.scrub_active { t.accent } else { t.text_dim };
+            ui.label(egui::RichText::new(format!("Wheel: {scrub_txt}")).color(scrub_col));
+        });
+
+        // 8-Channel Hardware Strip Monitor
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                for ch in 0..app.msc.config.channels {
+                    let tid = app.msc.track_for_channel(app.engine.session(), ch);
+                    let tr = tid.and_then(|id| app.engine.session().track(id));
+                    let is_touched = app.msc.fader_touched[ch];
+                    ui.vertical(|ui| {
+                        ui.set_width(70.0);
+                        let title = tr.map(|t| t.name.as_str()).unwrap_or("<empty>");
+                        ui.label(egui::RichText::new(format!("CH {}", ch + 1)).strong());
+                        ui.add(egui::Label::new(egui::RichText::new(title).small()).truncate());
+                        let db = tr.map(|t| t.mixer.volume_db).unwrap_or(-60.0);
+                        ui.label(egui::RichText::new(format!("{:.1} dB", db)).monospace());
+                        if is_touched {
+                            ui.label(egui::RichText::new("[TOUCH]").color(t.accent).strong());
+                        } else {
+                            ui.label(egui::RichText::new("Motor").color(t.text_dim));
+                        }
+                    });
+                }
+            });
+        });
+
+        ui.separator();
+
+        // Bluetooth BLE Controller Section
+        ui.label(egui::RichText::new("Bluetooth BLE-MIDI Manager (Wireless Controllers)").strong());
+        ui.horizontal(|ui| {
+            if app.msc.bluetooth_available {
+                let state_txt = if app.msc.bluetooth_powered { "POWERED ON" } else { "OFF" };
+                let col = if app.msc.bluetooth_powered { egui::Color32::from_rgb(0, 220, 130) } else { t.text_dim };
+                ui.label(egui::RichText::new(format!("Host Adapter: {state_txt}")).color(col));
+            } else {
+                ui.label(egui::RichText::new("Bluetooth Adapter: Not Detected").color(t.text_dim));
+            }
+            if ui.button("🔄 Refresh").clicked() {
+                app.msc.refresh_bluetooth();
+            }
+            if ui.button("🔍 Scan BLE").clicked() {
+                let _ = app.msc.scan_bluetooth();
+            }
+            if ui.button(egui::RichText::new("⚡ Auto-Connect M-Vave").strong()).clicked() {
+                let _ = app.msc.auto_connect_ble();
+            }
+        });
+
+        ui.label(egui::RichText::new(&app.msc.ble_status).italics().color(t.text_dim));
+
+        ui.group(|ui| {
+            ui.set_max_height(100.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if app.msc.ble_devices.is_empty() {
+                    let none = "No Bluetooth devices found. Click 'Scan BLE' for wireless operation,";
+                    ui.label(format!("{none} or enable Bluetooth pairing on the mixer."));
+                } else {
+                    let devices = app.msc.ble_devices.clone();
+                    let mut action: Option<(&'static str, String)> = None;
+                    for dev in &devices {
+                        ui.horizontal(|ui| {
+                            let icon = if dev.is_mvave { "🎛" } else { "📱" };
+                            ui.label(format!("{icon} {}", dev.name));
+                            ui.label(egui::RichText::new(&dev.mac).monospace().color(t.text_dim));
+                            if dev.is_mvave {
+                                ui.label(egui::RichText::new("[M-VAVE]").color(t.accent).strong());
+                            }
+                            if dev.connected {
+                                ui.label(egui::RichText::new("CONNECTED").color(egui::Color32::from_rgb(0, 220, 130)).strong());
+                                if ui.small_button("Disconnect").clicked() {
+                                    action = Some(("disconnect", dev.mac.clone()));
+                                }
+                            } else if ui.small_button("Connect").clicked() {
+                                action = Some(("connect", dev.mac.clone()));
+                            }
+                        });
+                    }
+                    if let Some((act, mac)) = action {
+                        if act == "connect" {
+                            let _ = app.msc.connect_ble(&mac);
+                        } else {
+                            let _ = app.msc.disconnect_ble(&mac);
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.separator();
+
+        // Diagnostics and Testing
+        ui.label(egui::RichText::new("MCU Diagnostics & Testing").strong());
+        ui.horizontal(|ui| {
+            if ui.button("🚨 Flash LEDs & Exercise Faders").clicked() {
+                app.msc.trigger_diagnostic_test();
+            }
+            if ui.button("📁 Reload mapping from config.json").on_hover_text("Re-read the mapping presets stored beside config.json").clicked() {
+                // The presets live beside the settings file, never in the process's working directory.
+                let dir = app.preset_dir.as_deref().and_then(std::path::Path::parent).map(std::path::Path::to_path_buf);
+                if let Some(dir) = dir {
+                    app.msc.ensure_config_loaded(Some(&dir));
+                } else {
+                    app.ui.status = "No settings directory: mapping presets cannot be read".to_string();
+                }
+            }
+            if ui.button("🔍 Auto-Detect Controller").clicked() {
+                app.msc.auto_detect();
+            }
+        });
+
+        if let Some(msg) = &app.msc.last_log_message {
+            ui.label(egui::RichText::new(format!("Activity: {msg}")).color(t.accent));
+        }
+    });
+    app.ui.show_msc_hardware = open;
 }
 
 #[cfg(test)]

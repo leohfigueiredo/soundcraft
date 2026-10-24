@@ -8,6 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 soundcraft-dsp.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -16,6 +17,9 @@ log.workspace = true
 # The Windows host window for embedded editors (a top-level HWND the plugin parents its GUI in).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [[test]]
 name = "editor_main_thread"

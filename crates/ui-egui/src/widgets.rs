@@ -3,7 +3,7 @@
 use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
 
 use crate::icons;
-use crate::theme::{Tokens, bold, regular};
+use crate::theme::{Tokens, bold, mono, regular};
 use egui::{Align2, Color32, CornerRadius, Mesh, Painter, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
 /// `c` moved towards white (`k > 0`) or black (`k < 0`).
@@ -169,17 +169,24 @@ pub(crate) fn selector_box_with_tooltip(ui: &mut Ui, width: f32, height: f32, te
     resp.on_hover_text(tooltip)
 }
 
-/// Rotary knob for pan / send pan (-1..1). Drag vertically; double-click resets.
-pub fn pan_knob(ui: &mut Ui, size: f32, value: &mut f32, tip: &str) -> Response {
+/// The quietest volume a knob reaches, in dB (same floor as the channel fader).
+pub const KNOB_MIN_DB: f32 = -60.0;
+/// The loudest volume a knob reaches, in dB.
+pub const KNOB_MAX_DB: f32 = 12.0;
+
+/// Volume (dB) → knob travel (0..1). Linear in dB: 0 dB sits at 5/6 of the travel.
+pub fn db_to_knob_norm(db: f32) -> f32 {
+    ((db.clamp(KNOB_MIN_DB, KNOB_MAX_DB) - KNOB_MIN_DB) / (KNOB_MAX_DB - KNOB_MIN_DB)).clamp(0.0, 1.0)
+}
+
+/// Knob travel (0..1) → volume (dB).
+pub fn knob_norm_to_db(norm: f32) -> f32 {
+    KNOB_MIN_DB + norm.clamp(0.0, 1.0) * (KNOB_MAX_DB - KNOB_MIN_DB)
+}
+
+/// Paints the knob body and its travel ring; `norm` is 0..1 with the pointer position.
+fn paint_knob(ui: &Ui, size: f32, r: Rect, norm: f32) {
     let t = Tokens::current();
-    let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
-    if resp.dragged() {
-        let d = resp.drag_delta();
-        *value = (*value + (d.x - d.y) * 0.01).clamp(-1.0, 1.0);
-    }
-    if resp.double_clicked() {
-        *value = 0.0;
-    }
     let p = ui.painter();
     let c = r.center();
     let rad = size * 0.42;
@@ -195,16 +202,170 @@ pub fn pan_knob(ui: &mut Ui, size: f32, value: &mut f32, tip: &str) -> Response 
             .collect()
     };
     let mid = start + sweep * 0.5;
-    let at = start + sweep * (*value * 0.5 + 0.5);
+    let at = start + sweep * norm.clamp(0.0, 1.0);
     let (a0, a1) = if at < mid { (at, mid) } else { (mid, at) };
     p.add(egui::Shape::line(arc(start, start + sweep), Stroke::new(2.0, t.meter_bg)));
     p.add(egui::Shape::line(arc(a0, a1), Stroke::new(2.0, t.counter_text)));
     p.circle_filled(c + vec2(0.0, 1.0), rad, Color32::from_black_alpha(90));
     rounded_vgradient(p, Rect::from_center_size(c, Vec2::splat(2.0 * rad)), 2.0 * rad, shade(t.knob_bg, 0.14), shade(t.knob_bg, -0.2));
     p.circle_stroke(c, rad - 0.75, Stroke::new(1.5, t.knob_ring));
+    if t.knob_style == crate::theme::KnobStyle::Hardware3D {
+        // Machined concentric metallic sheen
+        p.circle_stroke(c, rad * 0.7, Stroke::new(1.0, Color32::from_white_alpha(25)));
+        p.circle_stroke(c, rad * 0.4, Stroke::new(1.0, Color32::from_white_alpha(15)));
+    }
     let d = vec2(at.cos(), at.sin());
     p.line_segment([c + d * rad * 0.15, c + d * (rad - 2.5)], Stroke::new(2.0, t.knob_pointer));
+}
+
+/// Rotary knob for pan / send pan (-1..1). Drag vertically; double-click resets.
+pub fn pan_knob(ui: &mut Ui, size: f32, value: &mut f32, tip: &str) -> Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        *value = (*value + (d.x - d.y) * 0.01).clamp(-1.0, 1.0);
+    }
+    if resp.double_clicked() {
+        *value = 0.0;
+    }
+    paint_knob(ui, size, r, *value * 0.5 + 0.5);
     resp.on_hover_text(tip)
+}
+
+/// The LED colour of one ring segment at fraction `f` of the travel (X-Touch Compact's collar
+/// doubles as a meter: green low, amber mid, red top).
+fn led_colour(t: &Tokens, f: f32) -> Color32 {
+    if f >= 0.85 {
+        t.meter_red
+    } else if f >= 0.6 {
+        t.meter_yellow
+    } else {
+        t.meter_green
+    }
+}
+
+/// Behringer X-Touch Compact style: a dark rotary cap with a white pointer stripe, surrounded by
+/// a ring of LED segments that light up to the current value and bloom like a hardware encoder.
+/// `norm` is 0..1. Segment count adapts to the knob's size so a 14 px header knob still reads.
+pub fn paint_led_knob(ui: &Ui, size: f32, r: Rect, norm: f32) {
+    let t = Tokens::current();
+    let p = ui.painter();
+    let c = r.center();
+    let start = std::f32::consts::PI * 0.75;
+    let sweep = std::f32::consts::PI * 1.5;
+    let norm = norm.clamp(0.0, 1.0);
+    let n = if size >= 26.0 {
+        15
+    } else if size >= 18.0 {
+        11
+    } else {
+        9
+    };
+    let rr = size * 0.47;
+    let inner = rr - size * 0.075;
+    let outer = rr + size * 0.04;
+    let seg = size * 0.05;
+    for i in 0..n {
+        let f = if n == 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
+        let a = start + sweep * f;
+        let dir = vec2(a.cos(), a.sin());
+        let p0 = c + dir * inner;
+        let p1 = c + dir * outer;
+        if f <= norm {
+            let col = led_colour(&t, f);
+            // A wide, faint stroke under the crisp one gives the segment its glow.
+            p.line_segment([p0, p1], Stroke::new(seg * 2.4, col.gamma_multiply(0.22)));
+            p.line_segment([p0, p1], Stroke::new(seg, col));
+        } else {
+            p.line_segment([p0, p1], Stroke::new(seg, t.meter_bg.gamma_multiply(0.55)));
+        }
+    }
+    // Dark recessed cap (the X-Touch cap is black with a white pointer line).
+    let rad = size * 0.30;
+    p.circle_filled(c + vec2(0.0, size * 0.02), rad, Color32::from_black_alpha(140));
+    rounded_vgradient(p, Rect::from_center_size(c, Vec2::splat(2.0 * rad)), rad, shade(t.knob_bg, -0.5), shade(t.knob_bg, 0.05));
+    p.circle_stroke(c, rad, Stroke::new(1.0, t.knob_ring));
+    let at = start + sweep * norm;
+    let d = vec2(at.cos(), at.sin());
+    p.line_segment([c + d * rad * 0.15, c + d * (rad - 1.0)], Stroke::new(size * 0.09, Color32::WHITE));
+    // Luminous pointer tip.
+    let tip = led_colour(&t, norm);
+    p.circle_filled(c + d * (rad + size * 0.05), size * 0.08, tip);
+    p.circle_filled(c + d * (rad + size * 0.05), size * 0.035, Color32::WHITE);
+}
+
+/// A wide console volume fader for track headers (Reaper-like): a groove, a lit fill up to the
+/// value, the 0 dB detent, a bright handle and the dB readout inside. Click or drag to set the
+/// value; double-click for 0 dB. Returns the new dB when it changed.
+pub fn volume_slider(ui: &mut Ui, r: Rect, id: egui::Id, db: f32, tip: &str) -> Option<f32> {
+    let t = Tokens::current();
+    let before = db.clamp(KNOB_MIN_DB, KNOB_MAX_DB);
+    let resp = ui.interact(r, id, Sense::click_and_drag());
+    let mut now = before;
+    let groove = r.shrink2(vec2(0.0, 2.0));
+    let x_of = |n: f32| groove.min.x + groove.width() * n.clamp(0.0, 1.0);
+    if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
+        let n = ((pos.x - groove.min.x) / groove.width().max(1.0)).clamp(0.0, 1.0);
+        now = knob_norm_to_db(n);
+        // Snap to 0 dB within a pixel or two of the detent.
+        if (now - 0.0).abs() < 0.4 {
+            now = 0.0;
+        }
+    }
+    if resp.double_clicked() {
+        now = 0.0;
+    }
+    let p = ui.painter();
+    // Groove and its edges.
+    p.rect_filled(groove, 2.0, t.fader_track);
+    p.rect_stroke(groove, 2.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    let norm = db_to_knob_norm(now);
+    let detent = db_to_knob_norm(0.0);
+    // Fill: accent below 0 dB, red above it, with a soft glow on the top edge.
+    let fill = Rect::from_min_max(groove.min, pos2(x_of(norm), groove.max.y));
+    if norm > 0.0 {
+        p.rect_filled(fill, 2.0, if now > 0.0 { t.meter_red } else { t.accent });
+        let glow = Rect::from_min_max(pos2(groove.min.x, groove.min.y), pos2(x_of(norm), groove.min.y + 2.0));
+        p.rect_filled(glow, 1.0, Color32::from_white_alpha(70));
+    }
+    // 0 dB detent.
+    p.vline(x_of(detent), groove.y_range().shrink(1.5), Stroke::new(1.0, Color32::from_white_alpha(90)));
+    // Handle.
+    let hx = x_of(norm);
+    p.rect_filled(Rect::from_center_size(pos2(hx, groove.center().y), vec2(4.0, groove.height() + 2.0)), 1.5, Color32::WHITE);
+    p.rect_filled(Rect::from_center_size(pos2(hx, groove.center().y), vec2(2.0, groove.height())), 1.0, t.counter_text);
+    // Readout, right-aligned over the groove (contrasted by a dark plate).
+    let text = db_text(now);
+    let tw = (text.chars().count() as f32 * 6.0 + 6.0).min(groove.width() - 6.0);
+    let plate = Rect::from_min_max(pos2(groove.max.x - tw, groove.min.y + 1.0), groove.max - vec2(1.0, 1.0));
+    p.rect_filled(plate, 1.5, Color32::from_black_alpha(120));
+    p.text(plate.center(), Align2::CENTER_CENTER, text, mono(9.0), Color32::from_rgb(235, 240, 250));
+    resp.on_hover_text(format!("{tip}\n{}", db_text(now)));
+    (now != before).then_some(now)
+}
+
+/// Rotary volume knob in dB (-60..=+12, 0 dB detent). Drag up to raise; double-click for 0 dB.
+/// Returns the new dB when the user moved it.
+pub fn volume_knob(ui: &mut Ui, size: f32, db: f32, tip: &str) -> Option<f32> {
+    let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+    let before = db.clamp(KNOB_MIN_DB, KNOB_MAX_DB);
+    let mut now = before;
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        // Up (negative y) is louder; Shift/Ctrl-drag is fine (quarter speed).
+        let fine = ui.input(|i| i.modifiers.command || i.modifiers.ctrl || i.modifiers.shift);
+        let speed = if fine { 0.15 } else { 0.6 };
+        now = (now + (d.y - d.x) * speed).clamp(KNOB_MIN_DB, KNOB_MAX_DB);
+        if (now - 0.0).abs() < 0.05 {
+            now = 0.0;
+        }
+    }
+    if resp.double_clicked() {
+        now = 0.0;
+    }
+    paint_led_knob(ui, size, r, db_to_knob_norm(now));
+    resp.on_hover_text(format!("{tip}\n{}", db_text(now)));
+    (now != before).then_some(now)
 }
 
 /// Format a pan value like a console: "<45", "0", "45>".
@@ -245,25 +406,75 @@ pub fn meter(ui: &Ui, r: Rect, level: f32, hold: f32, clip: bool) {
     p.rect_filled(Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + 3.0)), 1.0, if clip { t.meter_red } else { t.meter_clip_off });
     p.rect_filled(Rect::from_min_max(pos2(r.min.x, r.min.y + 4.0), r.max), 0.0, t.meter_bg);
     let bar = meter_bar(r);
-    let y = |pos: f32| bar.max.y - bar.height() * pos;
-    let (amber, red) = (meter_pos(-12.0), meter_pos(-3.0));
-    let zones = [(0.0, amber, t.meter_green), (amber, red, t.meter_yellow), (red, 1.0, t.meter_red)];
-    let lit = level_pos(level);
-    let unlit = if t.meter_bg.intensity() > 0.5 { 0.08 } else { 0.18 };
-    let mut mesh = Mesh::default();
-    for (lo, hi, color) in zones {
-        let top = lit.clamp(lo, hi);
-        quad(&mut mesh, Rect::from_x_y_ranges(bar.x_range(), y(top)..=y(lo)), [color; 4]);
-        quad(&mut mesh, Rect::from_x_y_ranges(bar.x_range(), y(hi)..=y(top)), [color.gamma_multiply(unlit); 4]);
-    }
-    p.add(mesh);
-    for (_, at) in meter_marks(bar).skip(1) {
-        p.hline(bar.x_range(), p.round_to_pixel_center(at), Stroke::new(1.0, Color32::from_black_alpha(90)));
-    }
-    let held = level_pos(hold);
-    if held > 0.01 {
-        let color = zones.iter().find(|z| held <= z.1).map_or(t.meter_red, |z| z.2);
-        p.rect_filled(Rect::from_x_y_ranges(bar.x_range(), y(held) - 1.0..=y(held) + 1.0), 0.0, color);
+    match t.meter_style {
+        crate::theme::MeterStyle::Segmented12Led | crate::theme::MeterStyle::CyberNeon => {
+            // 12 discrete tactile LED ladder segments matching iCON P1-M hardware
+            const SEG_DBS: [f32; 12] = [-60.0, -48.0, -36.0, -28.0, -20.0, -14.0, -10.0, -6.0, -4.0, -2.0, -1.0, 0.0];
+            let n_segs = 12usize;
+            let gap = 1.5f32;
+            let seg_h = ((bar.height() - (n_segs as f32 - 1.0) * gap) / n_segs as f32).max(1.5);
+            let cur_db = if level <= 1e-6 { -80.0 } else { 20.0 * level.log10() };
+            let hold_db = if hold <= 1e-6 { -80.0 } else { 20.0 * hold.log10() };
+            let unlit_mult = if t.meter_bg.intensity() > 0.5 { 0.10 } else { 0.16 };
+
+            for i in 0..n_segs {
+                let color = if i < 8 {
+                    t.meter_green
+                } else if i < 10 {
+                    t.meter_yellow
+                } else {
+                    t.meter_red
+                };
+                let threshold = SEG_DBS[i];
+                let is_lit = cur_db >= threshold;
+                let is_hold = hold_db >= threshold && (i == 11 || hold_db < SEG_DBS[i + 1]);
+
+                let top_y = bar.max.y - (i as f32 + 1.0) * seg_h - i as f32 * gap;
+                let seg_r = Rect::from_min_size(pos2(bar.min.x, top_y), vec2(bar.width(), seg_h));
+
+                if is_lit {
+                    p.rect_filled(seg_r, 1.0, color);
+                    p.hline(seg_r.min.x + 1.0..=seg_r.max.x - 1.0, seg_r.min.y + 0.5, Stroke::new(0.5, Color32::from_white_alpha(45)));
+                } else if is_hold {
+                    p.rect_filled(seg_r, 1.0, color);
+                } else {
+                    p.rect_filled(seg_r, 1.0, color.gamma_multiply(unlit_mult));
+                }
+            }
+        }
+        crate::theme::MeterStyle::VintageVu => {
+            p.rect_filled(bar, 2.0, Color32::from_rgb(38, 34, 28));
+            let lit = level_pos(level);
+            let fill_h = bar.height() * lit;
+            let fill_r = Rect::from_min_max(pos2(bar.min.x, bar.max.y - fill_h), bar.max);
+            let meter_col = if lit > 0.85 { Color32::from_rgb(225, 60, 45) } else { Color32::from_rgb(255, 185, 55) };
+            p.rect_filled(fill_r, 1.0, meter_col);
+            for (_, at) in meter_marks(bar).skip(1) {
+                p.hline(bar.x_range(), p.round_to_pixel_center(at), Stroke::new(1.0, Color32::from_rgb(64, 56, 44)));
+            }
+        }
+        crate::theme::MeterStyle::Continuous => {
+            let y = |pos: f32| bar.max.y - bar.height() * pos;
+            let (amber, red) = (meter_pos(-12.0), meter_pos(-3.0));
+            let zones = [(0.0, amber, t.meter_green), (amber, red, t.meter_yellow), (red, 1.0, t.meter_red)];
+            let lit = level_pos(level);
+            let unlit = if t.meter_bg.intensity() > 0.5 { 0.08 } else { 0.18 };
+            let mut mesh = Mesh::default();
+            for (lo, hi, color) in zones {
+                let top = lit.clamp(lo, hi);
+                quad(&mut mesh, Rect::from_x_y_ranges(bar.x_range(), y(top)..=y(lo)), [color; 4]);
+                quad(&mut mesh, Rect::from_x_y_ranges(bar.x_range(), y(hi)..=y(top)), [color.gamma_multiply(unlit); 4]);
+            }
+            p.add(mesh);
+            for (_, at) in meter_marks(bar).skip(1) {
+                p.hline(bar.x_range(), p.round_to_pixel_center(at), Stroke::new(1.0, Color32::from_black_alpha(90)));
+            }
+            let held = level_pos(hold);
+            if held > 0.01 {
+                let color = zones.iter().find(|z| held <= z.1).map_or(t.meter_red, |z| z.2);
+                p.rect_filled(Rect::from_x_y_ranges(bar.x_range(), y(held) - 1.0..=y(held) + 1.0), 0.0, color);
+            }
+        }
     }
 }
 
@@ -310,12 +521,15 @@ pub fn clip_gain_to_pos(db: f32) -> f32 {
     if db >= -36.0 { 0.25 + (db + 36.0) / 72.0 * 0.75 } else { (1.0 - ((-36.0 - db) / 108.0).powf(1.0 / 1.5)) * 0.25 }
 }
 
-const FADER_CAP_H: f32 = 40.0;
+pub fn fader_cap_h(r: Rect) -> f32 {
+    if r.height() < 160.0 { (r.height() * 0.22).clamp(20.0, 30.0) } else { 38.0 }
+}
 
 /// The travel of a [`fader`] drawn in `r`: its cap's centre runs from the bottom (-inf) to the
 /// top (+12 dB).
 pub fn fader_slot(r: Rect) -> Rect {
-    Rect::from_center_size(r.center(), vec2(4.0, r.height() - FADER_CAP_H))
+    let cap_h = fader_cap_h(r);
+    Rect::from_center_size(r.center(), vec2(4.0, (r.height() - cap_h).max(20.0)))
 }
 
 /// A fader: returns the new dB value when dragged. `db` in -144..12.
@@ -340,17 +554,67 @@ pub fn fader(ui: &mut Ui, r: Rect, db: f32, id: egui::Id) -> Option<f32> {
     }
     let pos = soundcraft_model::fader_db_to_pos(db);
     let y = slot.max.y - slot.height() * pos;
-    let cap = Rect::from_center_size(pos2(slot.center().x, y), vec2(cap_w, FADER_CAP_H));
+    let cap_h = fader_cap_h(r);
+    let cap = Rect::from_center_size(pos2(slot.center().x, y), vec2(cap_w, cap_h));
     p.rect_filled(cap.translate(vec2(0.0, 2.0)).expand(1.0), 4.0, Color32::from_black_alpha(80));
     let g = Color32::from_gray;
-    p.rect_filled(cap, 3.0, g(34));
-    let face = cap.shrink(1.0);
-    rounded_vgradient(p, face, 2.0, g(236), g(104));
-    vgradient(p, Rect::from_x_y_ranges(face.x_range(), y + 1.0..=face.max.y - 2.0), g(214), g(150));
-    p.hline(face.min.x + 2.0..=face.max.x - 2.0, face.min.y + 1.5, Stroke::new(1.0, Color32::from_white_alpha(110)));
-    p.hline(face.x_range(), y, Stroke::new(2.0, g(30)));
-    for (x, dx) in [(cap.min.x, 2.5), (cap.max.x, -2.5)] {
-        p.add(egui::Shape::convex_polygon(vec![pos2(x, y - 3.0), pos2(x + dx, y), pos2(x, y + 3.0)], g(34), Stroke::NONE));
+    match t.fader_cap_style {
+        crate::theme::FaderCapStyle::TactileMetallic => {
+            // iCON P1-M Brushed Aluminum Tactile Motorized Fader Cap with 3 tactile center grip ribs
+            p.rect_filled(cap, 3.0, g(36));
+            let face = cap.shrink(1.0);
+            rounded_vgradient(p, face, 2.0, g(235), g(115));
+            vgradient(p, Rect::from_x_y_ranges(face.x_range(), y + 1.0..=face.max.y - 2.0), g(210), g(145));
+            p.hline(face.min.x + 2.0..=face.max.x - 2.0, face.min.y + 1.5, Stroke::new(1.0, Color32::from_white_alpha(120)));
+            // Center position indicator line (black)
+            p.hline(face.x_range(), y, Stroke::new(2.0, g(25)));
+            // 3 Tactile Raised Grip Ribs (matching iCON P1-M hardware)
+            for offset_y in [-7.0, -4.0, 4.0, 7.0] {
+                p.hline(face.min.x + 3.0..=face.max.x - 3.0, y + offset_y, Stroke::new(1.0, Color32::from_black_alpha(85)));
+                p.hline(face.min.x + 3.0..=face.max.x - 3.0, y + offset_y + 0.5, Stroke::new(0.5, Color32::from_white_alpha(80)));
+            }
+            for (x, dx) in [(cap.min.x, 2.5), (cap.max.x, -2.5)] {
+                p.add(egui::Shape::convex_polygon(vec![pos2(x, y - 3.0), pos2(x + dx, y), pos2(x, y + 3.0)], g(34), Stroke::NONE));
+            }
+        }
+        crate::theme::FaderCapStyle::StudioPro => {
+            // Studio Pro Black Piano Anodized Cap with Electric Cyan Center Glow Slit
+            p.rect_filled(cap, 3.0, Color32::from_rgb(12, 13, 17));
+            let face = cap.shrink(1.0);
+            rounded_vgradient(p, face, 2.0, Color32::from_rgb(46, 50, 60), Color32::from_rgb(20, 22, 27));
+            p.hline(face.min.x + 2.0..=face.max.x - 2.0, face.min.y + 1.0, Stroke::new(1.0, Color32::from_white_alpha(40)));
+            // Glowing Electric Cyan Center Slit
+            p.hline(face.x_range(), y, Stroke::new(2.5, t.accent));
+            p.hline(face.min.x + 2.0..=face.max.x - 2.0, y, Stroke::new(1.0, Color32::WHITE));
+            for (x, dx) in [(cap.min.x, 2.5), (cap.max.x, -2.5)] {
+                p.add(egui::Shape::convex_polygon(
+                    vec![pos2(x, y - 3.0), pos2(x + dx, y), pos2(x, y + 3.0)],
+                    Color32::from_rgb(12, 13, 17),
+                    Stroke::NONE,
+                ));
+            }
+        }
+        crate::theme::FaderCapStyle::VintageBakelite => {
+            // Vintage Console Fluted Bakelite Cap
+            p.rect_filled(cap, 2.0, Color32::from_rgb(32, 28, 25));
+            let face = cap.shrink(1.0);
+            rounded_vgradient(p, face, 1.5, Color32::from_rgb(90, 80, 72), Color32::from_rgb(50, 44, 40));
+            // Ivory white center marker
+            p.hline(face.x_range(), y, Stroke::new(2.0, Color32::from_rgb(235, 230, 215)));
+            for (x, dx) in [(cap.min.x, 2.0), (cap.max.x, -2.0)] {
+                p.add(egui::Shape::convex_polygon(
+                    vec![pos2(x, y - 3.0), pos2(x + dx, y), pos2(x, y + 3.0)],
+                    Color32::from_rgb(32, 28, 25),
+                    Stroke::NONE,
+                ));
+            }
+        }
+        crate::theme::FaderCapStyle::ModernFlat => {
+            p.rect_filled(cap, 1.0, g(28));
+            let face = cap.shrink(1.0);
+            p.rect_filled(face, 1.0, g(45));
+            p.hline(face.x_range(), y, Stroke::new(2.0, t.accent));
+        }
     }
     if resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.alt)) {
         return Some(0.0);

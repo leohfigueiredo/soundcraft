@@ -19,7 +19,6 @@ const KNOWN_UNREACHED: &[&str] = &[
     "markers.next",
     "markers.previous",
     "mix.clear_mutes",
-    "mix.clear_solos",
     "mix.insert_move",
     "mix.phase_invert",
     "mix.send_surround_pan",
@@ -28,6 +27,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "options.pre_roll",
     "setup.hardware",        // menu opens the Playback Engine window, which doesn't run it
     "setup.playback_engine", // same
+    "setup.preferences",     // menu opens the VST Folders / Plugin Manager window, which doesn't run it
     "setup.reset_edit_state",
     "track.load_preset",
     "track.pin",
@@ -102,4 +102,12 @@ fn new_midi_clip_is_in_the_clip_menu() {
     let tree = menus::tree();
     let clip = tree.iter().find(|n| n.label == "Clip").unwrap();
     assert_eq!(clip.children[0].label, "New MIDI Clip", "creates rather than edits, so it comes first");
+}
+
+#[test]
+fn preferences_menu_item_opens_plugin_preferences_window() {
+    let mut app = soundcraft_ui_egui::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, soundcraft_ui_egui::Services::default());
+    assert!(!app.ui.show_vst_folders);
+    soundcraft_ui_egui::menus::invoke_menu(&mut app, "setup.preferences", "Setup > Preferences...");
+    assert!(app.ui.show_vst_folders, "Setup > Preferences... opens the Plugin Manager / Preferences window");
 }

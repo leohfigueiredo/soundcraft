@@ -1,10 +1,10 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (bounces of a bus fed by an aux compensate its latency (#246); previously minor: audio device, rate and buffer choice; ASIO feature) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** minor (separate generic MIDI keyboard ports from control-surface matching; Casio/SMC regression fix) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 A DAW is judged by how it drives audio interfaces, MIDI gear, control surfaces and sync. This is
-SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal) and the absence of
-any MIDI-device or control-surface code; Pro Tools' from its documentation and Setup menus.
+SoundCraft's weakest dimension. Ours is measured from `crates/playback` (cpal) and the partial
+Linux ALSA MIDI keyboard/control-surface path; Pro Tools' from its documentation and Setup menus.
 
 **Hardware: ~12 % ready** (estimated). **Performance: ~35 %** (estimated; nothing benchmarked
 against Pro Tools). Remaining ≈ 110–180 h for hardware, 40–70 h for performance.
@@ -31,12 +31,12 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 
 | Feature | Pro Tools | SoundCraft (all platforms) |
 |---|---|---|
-| MIDI input devices (keyboards, pads) | ✅ | ❌ no MIDI device layer at all (`setup.midi_input_devices` stores names) |
-| MIDI output to external gear | ✅ | ❌ |
+| MIDI input devices (keyboards, pads) | ✅ | 🟡 ALSA sequencer input on Linux; keyboard ports are selectable separately from control surfaces (`ui-egui::midi_io`), but MIDI recording and non-Linux backends are missing |
+| MIDI output to external gear | ✅ | 🟡 the control-surface link sends LED/meter/motor feedback; a user-patchable MIDI-out port is not exposed |
 | MIDI Thru, input filter | ✅ | ❌ (stored flags only) |
 | MIDI Beat Clock out, MTC generate/chase | ✅ | ❌ |
-| MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | ❌ |
-| Virtual MIDI keyboard | ✅ (MIDI Keyboard window) | 🟡 window exists, no live audition path |
+| MIDI learn / controller mapping | ✅ (via surfaces and plug-in maps) | 🟡 MIDI Learn binds surface controls to volume, pan, sends and plugin/instrument parameters, persisted in `config.json`; the right-click picker on plugin knobs is still to wire |
+| Virtual MIDI keyboard | ✅ (MIDI Keyboard window) | ✅ horizontal dock (25–88 keys, mouse/touch/glissando, computer keys, live MIDI to the target track); no separate floating window |
 
 ## Control surfaces
 
@@ -44,8 +44,8 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 |---|---|---|
 | EUCON (S1/S3/S4/S6, Dock, Control app) | ✅ | ❌ Avid-proprietary SDK; owner decision |
 | HUI | ✅ | ❌ |
-| Mackie Control Universal | ✅ (via HUI emulation and personalities) | ❌ |
-| Generic MIDI controller personalities | ✅ | ❌ |
+| Mackie Control Universal | ✅ (via HUI emulation and personalities) | 🟡 iCON P1-M and M-Vave SMC-Mixer profiles over ALSA MIDI: faders with soft takeover, V-pots, mute/solo/arm/select, banks, transport, jog/scrub, flip, automation modes, LED/meter/motor feedback, hot-plug resync; no HUI-emulation personalities |
+| Generic MIDI controller personalities | ✅ | ❌ a JSON map per device (`msc_mixer_map.json`) covers the MCU mapping, not arbitrary personalities |
 
 ## Sync and video hardware
 
@@ -72,6 +72,8 @@ Legend: ✅ works · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-18 | minor | Prevent generic MIDI keyboard ports (including Casio USB-MIDI) from being claimed as control surfaces, so SMC-Mixer discovery and keyboard auto-selection can both work |
+| 2026-10-18 | minor | Control surfaces: ALSA sequencer link, hot-plug, soft takeover, MIDI Learn, bidirectional feedback; virtual keyboard dock; Linux VST3 editor windows |
 | 2026-10-13 | trivial | bounces of a bus fed by an aux compensate its latency (#246) |
 | 2026-10-12 | minor | Audio device settings: system, output, input, sample rate and buffer size; opt-in ASIO |
 | 2026-10-10 | major | Created: audit of audio interface, MIDI, control-surface, sync and performance support against Pro Tools 2026.4.1 |

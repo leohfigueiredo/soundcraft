@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
-use vst3::Steinberg::Vst::{self as sv};
+use vst3::Steinberg::Linux::{IEventHandlerTrait, IRunLoopTrait, ITimerHandlerTrait};
+use vst3::Steinberg::Vst::{self as sv, IUnitInfoTrait};
 use vst3::Steinberg::Vst::{
     IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait, IEventListTrait,
     IHostApplicationTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
@@ -85,6 +86,7 @@ fn ok(r: sb::tresult) -> bool {
 /// VST3's numbers for the MIDI controllers that aren't CCs.
 pub(crate) const AFTERTOUCH: usize = sv::ControllerNumbers_::kAfterTouch as usize;
 pub(crate) const PITCH_BEND: usize = sv::ControllerNumbers_::kPitchBend as usize;
+pub(crate) const PROGRAM_CHANGE: usize = sv::ControllerNumbers_::kCtrlProgramChange as usize;
 
 // ---- loaded binaries -----------------------------------------------------------------------
 
@@ -375,6 +377,7 @@ fn register_exit_hook() {
 impl Bundle {
     /// Loads (once per path, then cached for the life of the process) a `.vst3`.
     pub fn load(path: &Path) -> Result<Arc<Bundle>, Vst3Error> {
+        ensure_wine_dll_dirs_initialized();
         let mut cache = loaded().lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, b)) = cache.iter().find(|(p, _)| p == path) {
             return Ok(b.clone());
@@ -540,24 +543,50 @@ impl Bundle {
         };
         let processor = inst.component.cast::<sv::IAudioProcessor>().ok_or_else(|| err("no IAudioProcessor"))?;
         inst.processor = Some(processor);
-        // Edit controller: the component itself (single-component plugin) or a separate class.
-        if let Some(c) = inst.component.cast::<sv::IEditController>() {
+        // Edit controller. The component may implement `IEditController` itself, but when it also
+        // names a *separate* controller class that class owns the parameters: some plugins stub
+        // `IEditController` on the component (it answers everything with nothing) and keep the real
+        // controller beside it. Pianoteq 9 is one, and trusting the component left it with no
+        // parameters, no state and silence. So: a distinct controller class wins; the component is
+        // the controller only when it is the class the component names (single-component plugin).
+        let mut ccid: sb::TUID = [0; 16];
+        // SAFETY: valid component; `ccid` is a writable 16-byte TUID.
+        let names_controller = ok(unsafe { inst.component.getControllerClassId(&mut ccid) });
+        let controller_id = tuid_bytes(&ccid);
+        let separate = names_controller && controller_id != *cid;
+        log::warn!(
+            "vst3 {name}: component-as-controller={}, names_controller={names_controller} as {} (component {}), separate={separate}",
+            inst.component.cast::<sv::IEditController>().is_some(),
+            hex(&controller_id),
+            hex(cid)
+        );
+        if separate {
+            match self.create::<sv::IEditController>(&controller_id) {
+                Some(c) => {
+                    // SAFETY: fresh controller; the host context outlives it.
+                    if ok(unsafe { c.initialize(host_unknown) }) {
+                        inst.controller = Some(c);
+                        inst.controller_initialized = true;
+                    } else {
+                        log::warn!("vst3 {name}: controller initialize failed; parameters unavailable");
+                    }
+                }
+                None => log::warn!("vst3 {name}: the module cannot create its edit controller {}; parameters unavailable", hex(&controller_id)),
+            }
+        }
+        if inst.controller.is_none()
+            && let Some(c) = inst.component.cast::<sv::IEditController>()
+        {
             inst.controller = Some(c);
             inst.single = true;
+        }
+        if inst.controller.is_none() {
+            log::warn!("vst3 {name}: no edit controller; parameters and the editor are unavailable");
         } else {
-            let mut ccid: sb::TUID = [0; 16];
-            // SAFETY: valid component; `ccid` is a writable 16-byte TUID.
-            if ok(unsafe { inst.component.getControllerClassId(&mut ccid) })
-                && let Some(c) = self.create::<sv::IEditController>(&tuid_bytes(&ccid))
-            {
-                // SAFETY: fresh controller; the host context outlives it.
-                if ok(unsafe { c.initialize(host_unknown) }) {
-                    inst.controller = Some(c);
-                    inst.controller_initialized = true;
-                } else {
-                    log::warn!("vst3 {name}: controller initialize failed; parameters unavailable");
-                }
-            }
+            let walked = inst.params().len();
+            let declared = inst.declared_param_count();
+            let first = inst.first_param_info_ok();
+            log::warn!("vst3 {name}: controller: declared {declared}, walk {walked}, getParameterInfo(0) ok {first} (single={})", inst.single);
         }
         if let Some(c) = &inst.controller {
             if !inst.single
@@ -578,6 +607,7 @@ impl Bundle {
             }
         }
         inst.editor = Arc::new(EditorLink {
+            audio_busy: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(EditorInner { component: Some(inst.component.clone()), controller: inst.controller.clone(), ..EditorInner::default() }),
         });
         Ok(inst)
@@ -591,6 +621,110 @@ fn tuid_bytes(t: &sb::TUID) -> [u8; 16] {
         *o = *b as u8;
     }
     out
+}
+
+/// Folders a bridged Windows plugin imports DLLs from: for every `.vst3` in the yabridge mirrors,
+/// the folder on the Windows side that the mirror links to. A plugin that ships DLLs beside itself
+/// (Pianoteq's engine, many synths) only loads when Wine searches there.
+pub fn ensure_wine_dll_dirs_initialized() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| {
+        let dirs = bridged_plugin_dirs();
+        if !dirs.is_empty() {
+            add_wine_dll_dirs(&dirs);
+        }
+    });
+}
+
+pub fn bridged_plugin_dirs() -> Vec<String> {
+    /// Deepest nesting a mirror can have (`yabridgectl add` accepts any folder, and mirrors nest).
+    const MAX_DEPTH: usize = 6;
+    /// Most folders read per mirror (a hostile tree must not hang start-up).
+    const MAX_ENTRIES: usize = 4096;
+
+    let mut out: Vec<String> = Vec::new();
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        roots.push(home.join(".vst3").join("yabridge"));
+        roots.push(home.join(".vst").join("yabridge"));
+    }
+    let mut pending: Vec<(std::path::PathBuf, usize)> = roots.into_iter().map(|r| (r, 0)).collect();
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_ENTRIES {
+                return out;
+            }
+            let path = entry.path();
+            let is_vst3 = path.extension().and_then(|e| e.to_str()) == Some("vst3");
+            if is_vst3 {
+                // The Windows side of the mirror: a file (single-file plugin) or a bundle.
+                for arch in ["x86_64-win", "x86-win"] {
+                    let win = path.join("Contents").join(arch);
+                    let Ok(files) = std::fs::read_dir(&win) else { continue };
+                    for file in files.flatten() {
+                        let real = std::fs::canonicalize(file.path()).unwrap_or_else(|_| file.path());
+                        let Some(parent) = real.parent() else { continue };
+                        let unix = parent.to_path_buf();
+                        for candidate in [wine_path(&unix), unix.to_string_lossy().into_owned()] {
+                            if !candidate.is_empty() && !out.contains(&candidate) {
+                                out.push(candidate);
+                            }
+                        }
+                    }
+                }
+            } else if depth < MAX_DEPTH && path.is_dir() {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Prepends folders to `WINEPATH`, Wine's DLL search path, so a bridged plugin finds the DLLs it
+/// imports from its own folder. Call it once, before any thread starts: the environment is
+/// process-wide and this changes it.
+pub fn add_wine_dll_dirs(dirs: &[String]) {
+    if dirs.is_empty() {
+        return;
+    }
+    let mut value = std::env::var_os("WINEPATH").map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut changed = false;
+    for dir in dirs {
+        let dir = dir.clone();
+        if dir.is_empty() || value.split(';').any(|part| part == dir) {
+            continue;
+        }
+        if value.is_empty() {
+            value = dir;
+        } else {
+            value = format!("{dir};{value}");
+        }
+        changed = true;
+    }
+    if changed {
+        // SAFETY: the caller runs this from `main` before it starts any thread (the audio, MIDI,
+        // scanner and autosave workers all start later), so no other thread can be reading the
+        // environment while it changes; the variable is only ever grown, never removed.
+        unsafe { std::env::set_var("WINEPATH", value) };
+    }
+}
+
+/// A Unix folder as the Windows path Wine expects in `WINEPATH`: `drive_c` is `C:`, anything else
+/// is on `Z:`.
+fn wine_path(dir: &std::path::Path) -> String {
+    let text = dir.to_string_lossy().replace('/', "\\");
+    if let Some(home) = std::env::var_os("HOME") {
+        let prefix = std::path::PathBuf::from(home).join(".wine").join("drive_c");
+        let prefix = prefix.to_string_lossy().replace('/', "\\");
+        if let Some(rest) = text.strip_prefix(&format!("{prefix}\\")) {
+            return format!("C:\\{rest}");
+        }
+    }
+    format!("Z:{text}")
 }
 
 /// Upper-case hex of a class id (the form used in `vst3:<hex>` ids).
@@ -1151,6 +1285,20 @@ impl Instance {
         self.host.clone()
     }
 
+    /// Turns the host's run loop off for this plugin's editor: a bridged (Wine) plugin answers its
+    /// own Win32 event loop inside yabridge, and driving the same GUI from here as well can block it.
+    pub fn set_run_loop_enabled(&self, enabled: bool) {
+        if let Ok(mut g) = self.editor.inner.lock() {
+            g.run_loop_enabled = enabled;
+        }
+    }
+
+    /// Marks this instance busy while the returned guard lives (called around `process`). The
+    /// guard keeps its own reference, so it does not borrow the instance that is being used.
+    pub fn busy_guard(&self) -> AudioBusyGuard {
+        AudioBusyGuard::new(std::sync::Arc::clone(&self.editor))
+    }
+
     /// The editor link shared with editor handles (`None` without an edit controller).
     pub fn editor(&self) -> Option<Arc<EditorLink>> {
         self.editor.has_controller().then(|| Arc::clone(&self.editor))
@@ -1207,17 +1355,123 @@ impl Instance {
         }
     }
 
-    pub fn params(&self) -> Vec<RawParam> {
-        let Some(c) = &self.controller else { return Vec::new() };
+    /// `IEditController::getParameterCount` (deprecated but still declared by many plugins).
+    pub fn declared_param_count(&self) -> i32 {
+        let Some(c) = &self.controller else { return 0 };
         // SAFETY: valid controller.
-        let n = unsafe { c.getParameterCount() }.clamp(0, MAX_PARAMS);
+        unsafe { c.getParameterCount() }
+    }
+
+    /// Whether the controller answers `getParameterInfo(0)` right now.
+    pub fn first_param_info_ok(&self) -> bool {
+        let Some(c) = &self.controller else { return false };
+        // SAFETY: `ParameterInfo` is plain data; all-zero is valid.
+        let mut info: sv::ParameterInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: index 0; `info` is writable.
+        ok(unsafe { c.getParameterInfo(0, &mut info) })
+    }
+
+    /// The plugin's `IUnitInfo` program lists (program names included), or empty when it has none.
+    ///
+    /// VST3 has no "set program" call: a plugin that ships preset banks publishes them as program
+    /// lists here, and the host selects one through a parameter flagged `kIsProgramChange` (see
+    /// [`Instance::select_program`]).
+    pub fn program_lists(&self) -> Vec<soundcraft_dsp::ProgramList> {
+        Self::program_lists_of(&self.editor.lock())
+    }
+
+    fn program_lists_of(g: &EditorInner) -> Vec<soundcraft_dsp::ProgramList> {
+        let unit =
+            g.controller.as_ref().and_then(|c| c.cast::<sv::IUnitInfo>()).or_else(|| g.component.as_ref().and_then(|c| c.cast::<sv::IUnitInfo>()));
+        Self::program_lists_from(unit)
+    }
+
+    fn program_lists_from(u: Option<ComPtr<sv::IUnitInfo>>) -> Vec<soundcraft_dsp::ProgramList> {
+        let Some(u) = u else { return Vec::new() };
+        // SAFETY: valid `IUnitInfo`; the count is a plain answer.
+        let lists = unsafe { u.getProgramListCount() }.clamp(0, MAX_PROGRAM_LISTS);
         let mut out = Vec::new();
-        for i in 0..n {
+        for i in 0..lists {
+            // SAFETY: `ProgramListInfo` is plain data; all-zero is valid.
+            let mut info: sv::ProgramListInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: `i` is within the count the plugin just gave; `info` is writable.
+            if !ok(unsafe { u.getProgramListInfo(i, &mut info) }) {
+                continue;
+            }
+            let count = info.programCount.clamp(0, MAX_PROGRAMS);
+            let mut programs = Vec::with_capacity(count as usize);
+            for j in 0..count {
+                let mut name: sv::String128 = [0; 128];
+                // SAFETY: valid list id and index; `name` is a writable String128.
+                if ok(unsafe { u.getProgramName(info.id, j, &mut name) }) {
+                    programs.push(read_c16(&name));
+                } else {
+                    programs.push(format!("Program {}", j + 1));
+                }
+            }
+            out.push(soundcraft_dsp::ProgramList { id: info.id, name: read_c16(&info.name), programs });
+        }
+        out
+    }
+
+    /// Selects `program` of `list` (indices into [`Instance::program_lists`]).
+    ///
+    /// The VST3 way is a controller parameter flagged `kIsProgramChange` whose normalized value
+    /// addresses the program list; its value is the program index scaled to the parameter's range.
+    /// A plugin that has program lists but no such parameter is reported, not guessed at.
+    /// Returns the `(parameter id, normalized value)` it set, so the caller can forward the change
+    /// to the processor: with a *separate* controller (Pianoteq is one) the processor only learns
+    /// about it through the next block's parameter queue, and setting the controller alone changes
+    /// nothing audible.
+    pub fn select_program(&mut self, list: usize, program: usize) -> Result<(u32, f64), String> {
+        let lists = self.program_lists();
+        let Some(l) = lists.get(list) else { return Err(format!("this plugin has no program list {list}")) };
+        if program >= l.programs.len() {
+            return Err(format!("`{}` has {} programs, so {program} is out of range", l.name, l.programs.len()));
+        }
+        let Some(c) = self.controller.as_ref().cloned() else { return Err("the plugin has no edit controller".into()) };
+        // The program-change parameter: the one the SDK tags for exactly this.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..MAX_PARAMS {
             // SAFETY: `ParameterInfo` is plain data; all-zero is valid.
             let mut info: sv::ParameterInfo = unsafe { std::mem::zeroed() };
-            // SAFETY: index below the count; `info` is writable.
-            if !ok(unsafe { c.getParameterInfo(i, &mut info) }) {
+            // SAFETY: the controller answers by index; `info` is writable.
+            if !ok(unsafe { c.getParameterInfo(i, &mut info) }) || !seen.insert(info.id) {
+                break;
+            }
+            if info.flags & sv::ParameterInfo_::ParameterFlags_::kIsProgramChange == 0 {
                 continue;
+            }
+            // The parameter's own step count wins (a plugin may expose 128 steps for fewer programs).
+            let steps = if info.stepCount > 0 { info.stepCount as f64 } else { (l.programs.len().max(2) - 1) as f64 };
+            let normalized = (program as f64 / steps).clamp(0.0, 1.0);
+            // SAFETY: valid controller and a parameter id it just reported; the value is clamped.
+            unsafe { c.setParamNormalized(info.id, normalized) };
+            log::info!(
+                "vst3: program `{}` selected through parameter {} ({normalized:.4})",
+                l.programs.get(program).cloned().unwrap_or_default(),
+                info.id
+            );
+            return Ok((info.id, normalized));
+        }
+        Err(format!("`{}` publishes programs but no program-change parameter", l.name))
+    }
+
+    pub fn params(&self) -> Vec<RawParam> {
+        let Some(c) = &self.controller else { return Vec::new() };
+        let mut out = Vec::new();
+        // `IEditController::getParameterCount` was deprecated in VST3 3.6.14: modern plugins
+        // (Pianoteq 9 among them) return 0 there while still answering `getParameterInfo` by
+        // index. Trusting the count alone left such a plugin with no parameters at all — no
+        // defaults, no automation and nothing to restore — so walk the indices instead and stop
+        // at the first refusal or at a repeated id (a plugin that loops forever).
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..MAX_PARAMS {
+            // SAFETY: `ParameterInfo` is plain data; all-zero is valid.
+            let mut info: sv::ParameterInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: the controller answers by index; `info` is writable.
+            if !ok(unsafe { c.getParameterInfo(i, &mut info) }) || !seen.insert(info.id) {
+                break;
             }
             let d = info.defaultNormalizedValue;
             out.push(RawParam {
@@ -1262,7 +1516,7 @@ impl Instance {
     /// controller numbers: CCs 0–127, then [`AFTERTOUCH`] and [`PITCH_BEND`]. Main thread only.
     pub fn midi_mapping(&self) -> Vec<Option<u32>> {
         let Some(m) = self.controller.as_ref().and_then(|c| c.cast::<sv::IMidiMapping>()) else { return Vec::new() };
-        (0..=PITCH_BEND)
+        (0..=PROGRAM_CHANGE)
             .map(|n| {
                 let mut id: sv::ParamID = 0;
                 let n = i16::try_from(n).unwrap_or(0);
@@ -1555,14 +1809,247 @@ fn split_state(data: &[u8]) -> Option<(&[u8], &[u8])> {
 
 // ---- editor (IPlugView) --------------------------------------------------------------------
 
+// True while the host is inside a callback the plugin's own GUI started (a run-loop handler).
+// Whatever the plugin calls back into the host during that time must not call the plugin again:
+// nested calls into a Win32/Wine UI from inside its own event handler deadlock the UI thread.
+#[cfg(target_os = "linux")]
+thread_local! {
+    static IN_PLUGIN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_os = "linux")]
+fn in_plugin_callback() -> bool {
+    IN_PLUGIN_CALLBACK.with(|f| f.get())
+}
+
+/// Runs `f` inside the plugin's GUI callback (see [`IN_PLUGIN_CALLBACK`]).
+#[cfg(target_os = "linux")]
+fn enter_plugin_callback<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            IN_PLUGIN_CALLBACK.with(|f| f.set(self.0));
+        }
+    }
+    let previous = IN_PLUGIN_CALLBACK.with(|f| f.replace(true));
+    let _reset = Reset(previous);
+    f()
+}
+
+/// The host side of `Linux::IRunLoop`: the file descriptors and timers a plugin view registers so
+/// its GUI can deliver events. Without it a bridged (Wine) or JUCE editor opens a window that never
+/// answers: Wine and JUCE hand their event pump to the host and wait for it to fire.
+#[cfg(target_os = "linux")]
+pub(crate) struct RunLoop {
+    handlers: Mutex<Vec<(sb::int32, ComPtr<sb::Linux::IEventHandler>)>>,
+    timers: Mutex<Vec<RunTimer>>,
+}
+
+#[cfg(target_os = "linux")]
+struct RunTimer {
+    handler: ComPtr<sb::Linux::ITimerHandler>,
+    interval_ms: u64,
+    next: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for RunLoop {
+    fn default() -> Self {
+        RunLoop { handlers: Mutex::new(Vec::new()), timers: Mutex::new(Vec::new()) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Class for RunLoop {
+    type Interfaces = (sb::Linux::IRunLoop,);
+}
+
+#[cfg(target_os = "linux")]
+impl RunLoop {
+    /// Fires the handlers whose descriptor is readable and the timers that are due. Called from
+    /// the UI thread every frame while an editor is open; never blocks.
+    pub fn pump(&self) {
+        // Descriptors first: JUCE-style GUIs wake on their X connection and then want their timers.
+        // Snapshot the registrations, then call the handlers with no lock held: a handler may
+        // register or unregister another descriptor from inside the callback.
+        let handlers: Vec<(sb::int32, ComPtr<sb::Linux::IEventHandler>)> = self.handlers.lock().map(|h| h.clone()).unwrap_or_default();
+        if !handlers.is_empty() {
+            let mut fds: Vec<PollFd> = handlers.iter().map(|(fd, _)| PollFd { fd: *fd, events: POLLIN, revents: 0 }).collect();
+            let n = poll_fds(&mut fds);
+            if n > 0 {
+                let readable: Vec<sb::int32> = fds.iter().filter(|f| f.revents != 0).map(|f| f.fd).collect();
+                for (fd, handler) in handlers.iter() {
+                    if readable.contains(fd) {
+                        // SAFETY: the handler stays valid until the plugin unregisters it (the VST3
+                        // contract for `IRunLoop`), and we hold our own reference to it.
+                        enter_plugin_callback(|| unsafe { handler.onFDIsSet(*fd) });
+                    }
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        let mut due: Vec<(ComPtr<sb::Linux::ITimerHandler>, u64)> = Vec::new();
+        if let Ok(mut timers) = self.timers.lock() {
+            for timer in timers.iter_mut() {
+                if now >= timer.next {
+                    // Periodic: keep the cadence, but never fire a backlog after a stall.
+                    timer.next = now + std::time::Duration::from_millis(timer.interval_ms.max(1));
+                    due.push((timer.handler.clone(), timer.interval_ms));
+                }
+            }
+        }
+        for (handler, _) in due {
+            // SAFETY: registered handler, released only when the plugin unregisters it.
+            enter_plugin_callback(|| unsafe { handler.onTimer() });
+        }
+    }
+
+    /// `(descriptors, timers)` currently registered.
+    pub fn load(&self) -> (usize, usize) {
+        let fds = self.handlers.lock().map(|h| h.len()).unwrap_or(0);
+        let timers = self.timers.lock().map(|t| t.len()).unwrap_or(0);
+        (fds, timers)
+    }
+
+    fn remove_handler(&self, handler: *mut sb::Linux::IEventHandler) {
+        if let Ok(mut handlers) = self.handlers.lock() {
+            handlers.retain(|(_, h)| h.as_ptr() != handler);
+        }
+    }
+
+    fn remove_timer(&self, handler: *mut sb::Linux::ITimerHandler) {
+        if let Ok(mut timers) = self.timers.lock() {
+            timers.retain(|t| t.handler.as_ptr() != handler);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl IRunLoopTrait for RunLoop {
+    unsafe fn registerEventHandler(&self, handler: *mut sb::Linux::IEventHandler, fd: sb::Linux::FileDescriptor) -> sb::tresult {
+        // SAFETY: the plugin passes a live handler (or null, handled); the reference taken below
+        // keeps it alive for as long as it is registered.
+        let Some(handler) = (unsafe { vst3::ComRef::from_raw(handler) }) else { return sb::kInvalidArgument };
+        let owned = handler.to_com_ptr();
+        if let Ok(mut handlers) = self.handlers.lock()
+            && handlers.len() < MAX_RUN_LOOP_ENTRIES
+        {
+            log::debug!("editor run loop: view registered file descriptor {fd}");
+            handlers.push((fd, owned));
+            return sb::kResultOk;
+        }
+        sb::kResultFalse
+    }
+
+    unsafe fn unregisterEventHandler(&self, handler: *mut sb::Linux::IEventHandler) -> sb::tresult {
+        self.remove_handler(handler);
+        sb::kResultOk
+    }
+
+    unsafe fn registerTimer(&self, handler: *mut sb::Linux::ITimerHandler, milliseconds: sb::Linux::TimerInterval) -> sb::tresult {
+        // SAFETY: as above for the timer handler.
+        let Some(handler) = (unsafe { vst3::ComRef::from_raw(handler) }) else { return sb::kInvalidArgument };
+        let owned = handler.to_com_ptr();
+        let ms = milliseconds.clamp(1, 60_000);
+        if let Ok(mut timers) = self.timers.lock()
+            && timers.len() < MAX_RUN_LOOP_ENTRIES
+        {
+            log::debug!("editor run loop: view registered a {ms} ms timer");
+            timers.push(RunTimer { handler: owned, interval_ms: ms, next: std::time::Instant::now() + std::time::Duration::from_millis(ms) });
+            return sb::kResultOk;
+        }
+        sb::kResultFalse
+    }
+
+    unsafe fn unregisterTimer(&self, handler: *mut sb::Linux::ITimerHandler) -> sb::tresult {
+        self.remove_timer(handler);
+        sb::kResultOk
+    }
+}
+
+/// One `struct pollfd`, for the run loop's descriptor check.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct PollFd {
+    fd: sb::int32,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(target_os = "linux")]
+const POLLIN: i16 = 0x0001;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: std::ffi::c_ulong, timeout: std::ffi::c_int) -> std::ffi::c_int;
+}
+
+/// How many descriptors/timers one view may register (a hostile plugin must not grow memory).
+#[cfg(target_os = "linux")]
+const MAX_RUN_LOOP_ENTRIES: usize = 256;
+
+/// Polls `fds` with a zero timeout; a negative result (interrupted) reads as "nothing ready".
+#[cfg(target_os = "linux")]
+fn poll_fds(fds: &mut [PollFd]) -> i32 {
+    if fds.is_empty() {
+        return 0;
+    }
+    // SAFETY: `fds` is a live slice of `struct pollfd`; the length is its own.
+    let n = unsafe { poll(fds.as_mut_ptr(), fds.len() as std::ffi::c_ulong, 0) };
+    n.max(0)
+}
+
 /// The `IPlugFrame` handed to a plugin view: `resizeView` resizes our host window.
 pub(crate) struct PlugFrame {
     /// The host window (an `NSWindow*` on macOS), not owned; null when there is none.
     window: std::sync::atomic::AtomicPtr<c_void>,
+    /// Whether this view may register its event pump with us. Bridged (Wine) plugins answer their
+    /// own Win32 event loop inside yabridge at 60 Hz; registering here too means two threads drive
+    /// the same GUI, and a plugin whose GUI blocks (seen with Omnisphere) then freezes the editor.
+    run_loop_enabled: std::sync::atomic::AtomicBool,
+    /// The Linux run loop the plugin's view registers its event pump with. Shared with the editor
+    /// link, which pumps it *without* holding the editor's lock: a handler can call back into the
+    /// host (`resizeView`, parameter edits), and those calls take the same lock.
+    #[cfg(target_os = "linux")]
+    run_loop: std::sync::Arc<RunLoop>,
 }
 
+#[cfg(target_os = "linux")]
+impl Class for PlugFrame {
+    // A Linux plugin view asks its frame for `Linux::IRunLoop`: that is how the GUI gets its file
+    // descriptors and timers serviced.
+    type Interfaces = (sb::IPlugFrame, sb::Linux::IRunLoop);
+}
+
+#[cfg(not(target_os = "linux"))]
 impl Class for PlugFrame {
     type Interfaces = (sb::IPlugFrame,);
+}
+
+#[cfg(target_os = "linux")]
+impl IRunLoopTrait for PlugFrame {
+    unsafe fn registerEventHandler(&self, handler: *mut sb::Linux::IEventHandler, fd: sb::Linux::FileDescriptor) -> sb::tresult {
+        if !self.run_loop_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return sb::kResultFalse;
+        }
+        // SAFETY: forwarded to the run loop, which takes a reference to the handler.
+        unsafe { self.run_loop.registerEventHandler(handler, fd) }
+    }
+    unsafe fn unregisterEventHandler(&self, handler: *mut sb::Linux::IEventHandler) -> sb::tresult {
+        // SAFETY: as above.
+        unsafe { self.run_loop.unregisterEventHandler(handler) }
+    }
+    unsafe fn registerTimer(&self, handler: *mut sb::Linux::ITimerHandler, milliseconds: sb::Linux::TimerInterval) -> sb::tresult {
+        if !self.run_loop_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return sb::kResultFalse;
+        }
+        // SAFETY: as above.
+        unsafe { self.run_loop.registerTimer(handler, milliseconds) }
+    }
+    unsafe fn unregisterTimer(&self, handler: *mut sb::Linux::ITimerHandler) -> sb::tresult {
+        // SAFETY: as above.
+        unsafe { self.run_loop.unregisterTimer(handler) }
+    }
 }
 
 impl IPlugFrameTrait for PlugFrame {
@@ -1571,14 +2058,26 @@ impl IPlugFrameTrait for PlugFrame {
         let Some(r) = (unsafe { new_size.as_mut() }) else { return sb::kInvalidArgument };
         let (w, h) = rect_size(r);
         window::resize(self.window.load(Ordering::Relaxed), w, h);
-        // SAFETY: the plugin passes its own live view (or null, handled).
-        if let Some(v) = unsafe { vst3::ComRef::from_raw(view) } {
+        // Calling `onSize` tells the plugin the size it just asked for. When the request comes from
+        // inside the plugin's own GUI callback (its event handler), that call would re-enter its UI
+        // from within itself, which deadlocks a Wine-hosted editor, so it is skipped: the plugin
+        // already knows the size it asked for.
+        #[cfg(target_os = "linux")]
+        let skip_on_size = in_plugin_callback();
+        #[cfg(not(target_os = "linux"))]
+        let skip_on_size = false;
+        if !skip_on_size && let Some(v) = unsafe { vst3::ComRef::from_raw(view) } {
             // SAFETY: valid view; `r` is the plugin's own writable rect.
             unsafe { v.onSize(r) };
         }
         sb::kResultOk
     }
 }
+
+/// Most program lists we read from one plugin (a guarded envelope, not a prediction).
+const MAX_PROGRAM_LISTS: i32 = 64;
+/// Most programs read from one list (hostile input: a plugin may claim millions).
+const MAX_PROGRAMS: i32 = 8192;
 
 /// Width and height of a view rect, clamped to a sane window size.
 fn rect_size(r: &sb::ViewRect) -> (f64, f64) {
@@ -1596,6 +2095,52 @@ struct EditorInner {
     view: Option<ComPtr<sb::IPlugView>>,
     frame: Option<ComWrapper<PlugFrame>>,
     window: Option<window::HostWindow>,
+    /// The run-loop load last reported to the log, so the message appears when it changes.
+    run_loop_seen: (usize, usize),
+    /// How many more frames keep fitting the plugin's window to the editor's size (a plugin window
+    /// created late would otherwise stay at the virtual screen size).
+    fit_passes: u8,
+    /// The view's run loop (Linux), pumped from `idle` outside this lock.
+    #[cfg(target_os = "linux")]
+    run_loop: Option<std::sync::Arc<RunLoop>>,
+    /// Whether the view may register its event pump with the host's run loop (off for bridged
+    /// plugins, see [`PlugFrame::run_loop_enabled`]).
+    run_loop_enabled: bool,
+    /// True once the host window has been seen on screen. Before that a "not visible" reading is
+    /// just the window manager not having mapped it yet, and tearing the editor down there used to
+    /// call `IPlugView::removed()` while the plugin was still starting up.
+    seen_visible: bool,
+    /// Set while a worker thread is still closing this instance's view (see `EditorLink::teardown`).
+    /// Its `IPlugView::removed()` runs inside the plugin, so the plugin objects must not be released
+    /// until it returns — releasing them first is a use-after-free in the plugin's own code, which
+    /// takes the whole app down without a panic.
+    closing: Option<std::sync::Arc<Closing>>,
+}
+
+/// The handshake with the worker that closes an editor view (Linux, see `EditorLink::teardown`).
+#[derive(Default)]
+struct Closing {
+    done: std::sync::Mutex<bool>,
+    finished: std::sync::Condvar,
+}
+
+impl Closing {
+    /// Marks the view as detached and wakes whoever is waiting before the plugin goes.
+    fn finish(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
+        }
+        self.finished.notify_all();
+    }
+
+    /// Waits up to `limit` for the worker to finish. `true` when it is done.
+    fn wait(&self, limit: std::time::Duration) -> bool {
+        let Ok(done) = self.done.lock() else {
+            return false;
+        };
+        let (done, _) = self.finished.wait_timeout_while(done, limit, |d| !*d).unwrap_or_else(PoisonError::into_inner);
+        *done
+    }
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -1607,9 +2152,44 @@ struct EditorInner {
 #[derive(Default)]
 pub(crate) struct EditorLink {
     inner: Mutex<EditorInner>,
+    /// True while this instance is inside `IAudioProcessor::process` on the audio thread.
+    ///
+    /// The GUI run loop is *not* pumped during that time. A plugin call from the UI thread queues
+    /// behind the audio call in the bridge, and the host cannot finish the audio call until the GUI
+    /// event it is waiting for has been delivered — a deadlock that freezes the editor and the
+    /// audio at the same time. Deferring the pump by one frame breaks that cycle; the GUI events
+    /// are delivered on the next idle instead.
+    audio_busy: std::sync::atomic::AtomicBool,
+}
+
+/// Marks an instance as busy in `process` for as long as it lives (see [`EditorLink::audio_busy`]).
+pub(crate) struct AudioBusyGuard(std::sync::Arc<EditorLink>);
+
+impl AudioBusyGuard {
+    fn new(link: std::sync::Arc<EditorLink>) -> Self {
+        link.audio_busy.store(true, Ordering::Release);
+        AudioBusyGuard(link)
+    }
+}
+
+impl Drop for AudioBusyGuard {
+    fn drop(&mut self) {
+        self.0.audio_busy.store(false, Ordering::Release);
+    }
 }
 
 impl EditorLink {
+    /// Lists the plugin's programs through the link's controller: callable from the UI thread while
+    /// the instance belongs to the audio side (same lock the editor and state handles take).
+    pub fn program_lists(&self) -> Vec<soundcraft_dsp::ProgramList> {
+        Instance::program_lists_of(&self.lock())
+    }
+
+    /// True while the instance is processing audio.
+    pub fn is_audio_busy(&self) -> bool {
+        self.audio_busy.load(Ordering::Acquire)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, EditorInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1630,7 +2210,9 @@ impl EditorLink {
     /// without attaching it anywhere. For diagnostics and tests.
     pub fn probe(&self) -> Result<(u32, u32), String> {
         let g = self.lock();
+        log::debug!("editor: creating the view");
         let view = EditorLink::create_view(&g)?;
+        log::debug!("editor: view created");
         let platform = window::PLATFORM_TYPE.ok_or_else(|| "plugin editors are not supported on this platform".to_string())?;
         // SAFETY: valid view; `platform` is a static NUL-terminated string.
         if unsafe { view.isPlatformTypeSupported(platform) } != sb::kResultTrue {
@@ -1669,13 +2251,25 @@ impl EditorLink {
         // SAFETY: valid view; `r` is writable. On failure the default size stays.
         unsafe { view.getSize(&mut r) };
         let (w, h) = rect_size(&r);
+        log::debug!("editor: creating the host window {w}x{h}");
         let win = window::HostWindow::new(title, w, h)?;
+        log::debug!("editor: host window created");
+        #[cfg(target_os = "linux")]
+        let run_loop = std::sync::Arc::new(RunLoop::default());
+        #[cfg(target_os = "linux")]
+        let frame = ComWrapper::new(PlugFrame {
+            window: std::sync::atomic::AtomicPtr::new(win.raw()),
+            run_loop: std::sync::Arc::clone(&run_loop),
+            run_loop_enabled: std::sync::atomic::AtomicBool::new(g.run_loop_enabled),
+        });
+        #[cfg(not(target_os = "linux"))]
         let frame = ComWrapper::new(PlugFrame { window: std::sync::atomic::AtomicPtr::new(win.raw()) });
         if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
             // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
             // and detached in `teardown`).
             unsafe { view.setFrame(f.as_ptr()) };
         }
+        log::debug!("editor: attaching the view");
         // SAFETY: valid view; the parent is the live content view of `win`, of the type named.
         if !ok(unsafe { view.attached(win.parent(), platform) }) {
             // SAFETY: valid view; detach our frame again.
@@ -1683,25 +2277,80 @@ impl EditorLink {
             win.close();
             return Err("the editor could not attach to its window".into());
         }
+        // The host tells the view its size once it is attached, so a plugin that waits for the
+        // frame (rather than resizing itself) still lays its GUI out inside our window.
+        // SAFETY: valid, attached view; `size` is a writable rect for the call.
+        let mut size = sb::ViewRect { left: 0, top: 0, right: w.clamp(1.0, 16_384.0) as sb::int32, bottom: h.clamp(1.0, 16_384.0) as sb::int32 };
+        unsafe { view.onSize(&mut size) };
+        log::debug!("editor: view attached");
+        // The plugin's window exists from here on; make it the editor's size (see
+        // `fit_plugin_windows`). Repeated on the first frames of `idle`, because some plugins create
+        // the window a moment after attaching.
+        let fitted = win.fit_plugin_windows(w.clamp(1.0, 16_384.0) as u32, h.clamp(1.0, 16_384.0) as u32);
+        if fitted > 0 {
+            log::info!("editor: resized {fitted} plugin window(s) to {}x{}", w as u32, h as u32);
+        }
+        g.fit_passes = 4;
         win.raise();
         g.view = Some(view);
         g.frame = Some(frame);
+        #[cfg(target_os = "linux")]
+        {
+            g.run_loop = Some(run_loop);
+        }
         g.window = Some(win);
         Ok(())
     }
 
     fn teardown(g: &mut EditorInner) {
-        if let Some(view) = g.view.take() {
-            // SAFETY: valid, attached view; main thread (callers check). `removed` before the
-            // window goes, and the frame is detached before it is released.
-            unsafe {
-                view.removed();
-                view.setFrame(std::ptr::null_mut());
+        #[cfg(target_os = "linux")]
+        {
+            // Close the window first so the editor disappears immediately, then detach the view on a
+            // worker: a plugin that hangs in `removed()` (seen with a bridged Pianoteq) then costs one
+            // leaked thread instead of freezing the interface and the audio.
+            g.seen_visible = false;
+            if let Some(w) = g.window.take() {
+                w.close();
+            }
+            if let Some(view) = g.view.take() {
+                let frame = g.frame.take();
+                // The instance may be dropped while this runs (a re-instantiation, a session swap):
+                // `kill` waits on this before letting the plugin objects go.
+                let closing = std::sync::Arc::new(Closing::default());
+                g.closing = Some(std::sync::Arc::clone(&closing));
+                let spawned = std::thread::Builder::new().name("vst3-editor-close".to_string()).spawn(move || {
+                    // SAFETY: the view was attached to this frame; both are owned by this thread now
+                    // and nothing else touches them (the window is gone).
+                    unsafe {
+                        view.removed();
+                        view.setFrame(std::ptr::null_mut());
+                    }
+                    drop(frame);
+                    closing.finish();
+                });
+                if spawned.is_err() {
+                    // The closure owns the view; a failed spawn gives it back to nobody, so it is
+                    // leaked on purpose rather than blocked on. Nobody will report the close, so do
+                    // not leave the instance waiting for it either.
+                    g.closing = None;
+                    log::warn!("editor: cannot start the thread that closes the view; leaking it instead of blocking");
+                }
             }
         }
-        g.frame = None;
-        if let Some(w) = g.window.take() {
-            w.close();
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(view) = g.view.take() {
+                // SAFETY: valid, attached view; main thread (callers check). `removed` before the
+                // window goes, and the frame is detached before it is released.
+                unsafe {
+                    view.removed();
+                    view.setFrame(std::ptr::null_mut());
+                }
+            }
+            g.frame = None;
+            if let Some(w) = g.window.take() {
+                w.close();
+            }
         }
     }
 
@@ -1761,9 +2410,54 @@ impl EditorLink {
         if !window::on_main_thread() {
             return;
         }
+        // The view's event pump first, *without* the lock: a plugin handler may call back into this
+        // host (`resizeView`, a parameter edit) and those callbacks take the lock, which would
+        // deadlock the UI thread on a mutex that cannot be re-entered.
+        // Never service the GUI while the audio thread is inside `process` (see `audio_busy`): the
+        // two calls would wait for each other inside the bridge and freeze both.
+        #[cfg(target_os = "linux")]
+        if self.is_audio_busy() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        let run_loop = self.lock().run_loop.clone();
+        #[cfg(target_os = "linux")]
+        if let Some(run_loop) = run_loop {
+            let (fds, timers) = run_loop.load();
+            let changed = self.lock().run_loop_seen != (fds, timers);
+            if changed {
+                self.lock().run_loop_seen = (fds, timers);
+                log::info!("editor run loop: {fds} descriptor(s), {timers} timer(s) from the plugin's GUI");
+            }
+            let started = std::time::Instant::now();
+            run_loop.pump();
+            let took = started.elapsed();
+            if took > std::time::Duration::from_millis(200) {
+                log::warn!("editor: the plugin's GUI event pump took {} ms", took.as_millis());
+            }
+        }
         let mut g = self.lock();
-        if g.window.as_ref().is_some_and(|w| !w.is_visible()) {
-            EditorLink::teardown(&mut g);
+        #[cfg(target_os = "linux")]
+        if g.fit_passes > 0 {
+            g.fit_passes -= 1;
+            if let Some(w) = &g.window {
+                let (cw, ch) = w.client_size();
+                if cw > 0 && ch > 0 {
+                    w.fit_plugin_windows(cw, ch);
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(w) = &g.window {
+            w.poll_events();
+        }
+        // The user closed the window (only meaningful once it has actually been shown).
+        if let Some(w) = &g.window {
+            if w.is_visible() {
+                g.seen_visible = true;
+            } else if g.seen_visible {
+                EditorLink::teardown(&mut g);
+            }
         }
     }
 
@@ -1822,11 +2516,30 @@ impl EditorLink {
                 }
             }
         }
+        // A worker may still be inside `IPlugView::removed()`. Releasing the controller and the
+        // component before it returns is a use-after-free in the plugin (it happened when a scan
+        // finished and the session's instances were rebuilt with editors open: the app vanished
+        // with no panic in the log). Wait for it; if it is stuck, leak the objects instead.
+        if let Some(closing) = g.closing.take()
+            && !closing.wait(CLOSE_VIEW_WAIT)
+        {
+            log::warn!("vst3: the editor is still closing; keeping the plugin objects alive rather than releasing them under it");
+            if let Some(c) = g.controller.take() {
+                std::mem::forget(c);
+            }
+            if let Some(c) = g.component.take() {
+                std::mem::forget(c);
+            }
+            leaked = true;
+        }
         g.component = None;
         g.controller = None;
         leaked
     }
 }
+
+/// How long the instance waits for the editor-closing worker before it leaks the plugin objects.
+const CLOSE_VIEW_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 /// The platform host window for plugin views.
 #[cfg(target_os = "macos")]
@@ -2101,8 +2814,410 @@ mod window {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod window {
+    use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeX11EmbedWindowID);
+
+    type Display = c_void;
+
+    #[repr(C)]
+    struct XClassHint {
+        res_name: *mut c_char,
+        res_class: *mut c_char,
+    }
+
+    #[repr(C, align(8))]
+    pub struct XEventBuf([u8; 256]);
+
+    #[repr(C)]
+    struct XAnyEvent {
+        type_: c_int,
+        serial: c_ulong,
+        send_event: c_int,
+        display: *mut Display,
+        window: c_ulong,
+    }
+
+    #[repr(C)]
+    struct XClientMessageEvent {
+        type_: c_int,
+        serial: c_ulong,
+        send_event: c_int,
+        display: *mut Display,
+        window: c_ulong,
+        message_type: c_ulong,
+        format: c_int,
+        data: [c_long; 5],
+    }
+
+    unsafe extern "system" fn ignore_x_error(_display: *mut Display, _event: *mut c_void) -> c_int {
+        0
+    }
+
+    fn install_error_handler() {
+        unsafe {
+            x_set_error_handler(Some(ignore_x_error));
+        }
+    }
+
+    const CLIENT_MESSAGE: c_int = 33;
+    const DESTROY_NOTIFY: c_int = 17;
+    const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        #[link_name = "XOpenDisplay"]
+        fn x_open_display(name: *const c_char) -> *mut Display;
+        #[link_name = "XCloseDisplay"]
+        fn x_close_display(display: *mut Display) -> c_int;
+        #[link_name = "XDefaultRootWindow"]
+        fn x_default_root_window(display: *mut Display) -> c_ulong;
+        #[link_name = "XCreateSimpleWindow"]
+        fn x_create_simple_window(
+            display: *mut Display,
+            parent: c_ulong,
+            x: c_int,
+            y: c_int,
+            width: c_uint,
+            height: c_uint,
+            border_width: c_uint,
+            border: c_ulong,
+            background: c_ulong,
+        ) -> c_ulong;
+        #[link_name = "XStoreName"]
+        fn x_store_name(display: *mut Display, window: c_ulong, name: *const c_char) -> c_int;
+        #[link_name = "XInternAtom"]
+        fn x_intern_atom(display: *mut Display, name: *const c_char, only_if_exists: c_int) -> c_ulong;
+        #[link_name = "XSetWMProtocols"]
+        fn x_set_wm_protocols(display: *mut Display, window: c_ulong, protocols: *mut c_ulong, count: c_int) -> c_int;
+        #[link_name = "XSetClassHint"]
+        fn x_set_class_hint(display: *mut Display, window: c_ulong, hint: *mut XClassHint) -> c_int;
+        #[link_name = "XSelectInput"]
+        fn x_select_input(display: *mut Display, window: c_ulong, mask: c_long) -> c_int;
+        #[link_name = "XUnmapWindow"]
+        fn x_unmap_window(display: *mut Display, window: c_ulong) -> c_int;
+        #[link_name = "XDestroyWindow"]
+        fn x_destroy_window(display: *mut Display, window: c_ulong) -> c_int;
+        #[link_name = "XResizeWindow"]
+        fn x_resize_window(display: *mut Display, window: c_ulong, width: c_uint, height: c_uint) -> c_int;
+        #[link_name = "XGetGeometry"]
+        fn x_get_geometry(
+            display: *mut Display,
+            window: c_ulong,
+            root: *mut c_ulong,
+            x: *mut c_int,
+            y: *mut c_int,
+            width: *mut c_uint,
+            height: *mut c_uint,
+            border: *mut c_uint,
+            depth: *mut c_uint,
+        ) -> c_int;
+        #[link_name = "XRaiseWindow"]
+        fn x_raise_window(display: *mut Display, window: c_ulong) -> c_int;
+        #[link_name = "XFlush"]
+        fn x_flush(display: *mut Display) -> c_int;
+        #[link_name = "XPending"]
+        fn x_pending(display: *mut Display) -> c_int;
+        #[link_name = "XNextEvent"]
+        fn x_next_event(display: *mut Display, event: *mut XEventBuf) -> c_int;
+        #[link_name = "XMapRaised"]
+        fn x_map_raised(display: *mut Display, window: c_ulong) -> c_int;
+        #[link_name = "XSetTransientForHint"]
+        fn x_set_transient_for_hint(display: *mut Display, window: c_ulong, parent: c_ulong) -> c_int;
+        #[link_name = "XQueryTree"]
+        fn x_query_tree(
+            display: *mut Display,
+            window: c_ulong,
+            root: *mut c_ulong,
+            parent: *mut c_ulong,
+            children: *mut *mut c_ulong,
+            count: *mut c_uint,
+        ) -> c_int;
+        #[link_name = "XGetClassHint"]
+        fn x_get_class_hint(display: *mut Display, window: c_ulong, hint: *mut XClassHint) -> c_int;
+        #[link_name = "XChangeProperty"]
+        fn x_change_property(
+            display: *mut Display,
+            window: c_ulong,
+            property: c_ulong,
+            type_: c_ulong,
+            format: c_int,
+            mode: c_int,
+            data: *const c_uchar,
+            nelements: c_int,
+        ) -> c_int;
+        #[link_name = "XFree"]
+        fn x_free(data: *mut c_void) -> c_int;
+        #[link_name = "XSetInputFocus"]
+        fn x_set_input_focus(display: *mut Display, window: c_ulong, revert_to: c_int, time: c_ulong) -> c_int;
+        #[link_name = "XSetErrorHandler"]
+        fn x_set_error_handler(
+            handler: Option<unsafe extern "system" fn(*mut Display, *mut c_void) -> c_int>,
+        ) -> Option<unsafe extern "system" fn(*mut Display, *mut c_void) -> c_int>;
+        #[link_name = "XInitThreads"]
+        fn x_init_threads() -> c_int;
+    }
+
+    fn cstr(s: &str) -> CString {
+        CString::new(s.replace('\0', "")).unwrap_or_default()
+    }
+
+    struct WindowInner {
+        display: *mut Display,
+        window: c_ulong,
+        protocols_atom: c_ulong,
+        delete_atom: c_ulong,
+        closed: AtomicBool,
+    }
+
+    pub struct HostWindow {
+        inner: Box<WindowInner>,
+    }
+
+    unsafe impl Send for HostWindow {}
+
+    impl HostWindow {
+        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+            static XINIT: std::sync::Once = std::sync::Once::new();
+            XINIT.call_once(|| unsafe {
+                let _ = x_init_threads();
+            });
+            install_error_handler();
+            let display = unsafe { x_open_display(std::ptr::null()) };
+            if display.is_null() {
+                return Err("cannot open the X11 display (is DISPLAY set? Wayland needs XWayland)".into());
+            }
+            unsafe {
+                let root = x_default_root_window(display);
+                let width = w.clamp(64.0, 16_384.0) as c_uint;
+                let height = h.clamp(64.0, 16_384.0) as c_uint;
+                let window = x_create_simple_window(display, root, 160, 120, width, height, 0, 0, 0);
+                if window == 0 {
+                    x_close_display(display);
+                    return Err("cannot create the plugin window".into());
+                }
+                let title = cstr(title);
+                x_store_name(display, window, title.as_ptr());
+                let name = cstr("soundcraft-plugin");
+                let class = cstr("SoundCraft");
+                let mut hint = XClassHint { res_name: name.as_ptr().cast_mut(), res_class: class.as_ptr().cast_mut() };
+                x_set_class_hint(display, window, &mut hint);
+                let protocols_atom = x_intern_atom(display, c"WM_PROTOCOLS".as_ptr(), 0);
+                let delete_atom = x_intern_atom(display, c"WM_DELETE_WINDOW".as_ptr(), 0);
+                let mut protocols = [delete_atom];
+                x_set_wm_protocols(display, window, protocols.as_mut_ptr(), 1);
+                x_select_input(display, window, STRUCTURE_NOTIFY_MASK);
+                if let Some(parent) = find_app_window(display, window) {
+                    if parent != window {
+                        x_set_transient_for_hint(display, window, parent);
+                    }
+                }
+                let wm_state = x_intern_atom(display, c"_NET_WM_STATE".as_ptr(), 0);
+                let above = x_intern_atom(display, c"_NET_WM_STATE_ABOVE".as_ptr(), 0);
+                let atom_type = x_intern_atom(display, c"ATOM".as_ptr(), 0);
+                if wm_state != 0 && above != 0 && atom_type != 0 {
+                    let data = [above as u8, 0, 0, 0, 0, 0, 0, 0];
+                    x_change_property(display, window, wm_state, 4, 32, 0, data.as_ptr(), 1);
+                }
+                x_map_raised(display, window);
+                x_raise_window(display, window);
+                // Give the editor the keyboard as well as the mouse: the window is transient for
+                // the app, so the WM keeps it on top; a plugin GUI that never gets focus swallows
+                // typing (and some render their controls only once focused). Errors are ignored by
+                // the handler installed above (a WM may refuse while the window is not mapped yet).
+                const REVERT_TO_PARENT: c_int = 2;
+                x_set_input_focus(display, window, REVERT_TO_PARENT, 0);
+                x_flush(display);
+                Ok(HostWindow { inner: Box::new(WindowInner { display, window, protocols_atom, delete_atom, closed: AtomicBool::new(false) }) })
+            }
+        }
+
+        pub fn raw(&self) -> *mut c_void {
+            (&*self.inner as *const WindowInner as *mut WindowInner).cast()
+        }
+
+        pub fn parent(&self) -> *mut c_void {
+            self.inner.window as *mut c_void
+        }
+
+        /// This window's current width and height (`(0, 0)` when unknown).
+        pub fn client_size(&self) -> (c_uint, c_uint) {
+            if self.inner.closed.load(Ordering::Relaxed) {
+                return (0, 0);
+            }
+            let (mut x, mut y, mut w, mut h, mut border, mut depth) = (0, 0, 0u32, 0u32, 0u32, 0u32);
+            let mut root = 0 as c_ulong;
+            // SAFETY: our own window, live as long as this handle is.
+            let ok =
+                unsafe { x_get_geometry(self.inner.display, self.inner.window, &mut root, &mut x, &mut y, &mut w, &mut h, &mut border, &mut depth) };
+            if ok == 0 { (0, 0) } else { (w, h) }
+        }
+
+        /// Resizes the plugin's own window(s) inside this one to its client size.
+        ///
+        /// A bridged (Wine) plugin creates its window at the virtual screen size and keeps it: with
+        /// yabridge the wrapper around it is resized to the editor size, but the plugin's window is
+        /// not, so the plugin lays its GUI out for the whole screen and the editor shows a corner of
+        /// it. Resizing that window from here makes Wine adopt the editor's size (it handles the
+        /// resulting `ConfigureNotify` like any other window resize). Only windows bigger than this
+        /// one are touched, a few levels deep, and never this window itself.
+        pub fn fit_plugin_windows(&self, width: c_uint, height: c_uint) -> usize {
+            if self.inner.closed.load(Ordering::Relaxed) {
+                return 0;
+            }
+            let mut fitted = 0usize;
+            let mut level: Vec<c_ulong> = vec![self.inner.window];
+            for _depth in 0..3 {
+                let mut next: Vec<c_ulong> = Vec::new();
+                for parent in level {
+                    let (mut root, mut child_parent, mut children, mut count) = (0 as c_ulong, 0 as c_ulong, std::ptr::null_mut(), 0u32);
+                    let ok = unsafe { x_query_tree(self.inner.display, parent, &mut root, &mut child_parent, &mut children, &mut count) };
+                    if ok == 0 || children.is_null() {
+                        continue;
+                    }
+                    let list: &[c_ulong] = unsafe { std::slice::from_raw_parts(children, count as usize) };
+                    for &child in list {
+                        let (mut x, mut y, mut w, mut h, mut border, mut depth) = (0, 0, 0u32, 0u32, 0u32, 0u32);
+                        let mut geo_root = 0 as c_ulong;
+                        let got = unsafe {
+                            x_get_geometry(self.inner.display, child, &mut geo_root, &mut x, &mut y, &mut w, &mut h, &mut border, &mut depth)
+                        };
+                        if got != 0 && (w > width || h > height) {
+                            // SAFETY: a window in our own subtree; only its size changes.
+                            unsafe { x_resize_window(self.inner.display, child, width, height) };
+                            fitted += 1;
+                        }
+                        next.push(child);
+                    }
+                    unsafe { x_free(children.cast()) };
+                }
+                level = next;
+            }
+            unsafe { x_flush(self.inner.display) };
+            fitted
+        }
+
+        pub fn raise(&self) {
+            if self.inner.closed.load(Ordering::Relaxed) {
+                return;
+            }
+            unsafe {
+                x_raise_window(self.inner.display, self.inner.window);
+                x_flush(self.inner.display);
+            }
+        }
+
+        pub fn poll_events(&self) {
+            if self.inner.closed.load(Ordering::Relaxed) {
+                return;
+            }
+            unsafe {
+                for _ in 0..1024 {
+                    if x_pending(self.inner.display) <= 0 {
+                        break;
+                    }
+                    let mut event = XEventBuf([0u8; 256]);
+                    x_next_event(self.inner.display, &mut event);
+                    let any = &*(&event as *const XEventBuf as *const XAnyEvent);
+                    match any.type_ {
+                        CLIENT_MESSAGE => {
+                            let cm = &*(&event as *const XEventBuf as *const XClientMessageEvent);
+                            let delete = cm.message_type == self.inner.protocols_atom && cm.data[0] as c_ulong == self.inner.delete_atom;
+                            if delete {
+                                self.inner.closed.store(true, Ordering::Relaxed);
+                                x_unmap_window(self.inner.display, self.inner.window);
+                            }
+                        }
+                        DESTROY_NOTIFY => self.inner.closed.store(true, Ordering::Relaxed),
+                        _ => {}
+                    }
+                }
+                x_flush(self.inner.display);
+            }
+        }
+
+        pub fn is_visible(&self) -> bool {
+            !self.inner.closed.load(Ordering::Relaxed)
+        }
+
+        pub fn close(self) {
+            unsafe {
+                if self.inner.window != 0 {
+                    x_destroy_window(self.inner.display, self.inner.window);
+                }
+                x_close_display(self.inner.display);
+            }
+        }
+    }
+
+    pub fn resize(window: *mut c_void, w: f64, h: f64) {
+        let Some(inner) = (unsafe { (window as *const WindowInner).as_ref() }) else { return };
+        if inner.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let width = w.clamp(32.0, 16_384.0) as c_uint;
+        let height = h.clamp(32.0, 16_384.0) as c_uint;
+        unsafe {
+            x_resize_window(inner.display, inner.window, width, height);
+            x_flush(inner.display);
+        }
+    }
+
+    fn find_app_window(display: *mut Display, ignore: c_ulong) -> Option<c_ulong> {
+        unsafe {
+            let root = x_default_root_window(display);
+            let (mut r, mut p) = (0 as c_ulong, 0 as c_ulong);
+            let mut children: *mut c_ulong = std::ptr::null_mut();
+            let mut count: c_uint = 0;
+            if x_query_tree(display, root, &mut r, &mut p, &mut children, &mut count) == 0 || children.is_null() {
+                return None;
+            }
+            let mut found = None;
+            for i in 0..count as isize {
+                let win = *children.offset(i);
+                if win == ignore || win == 0 {
+                    continue;
+                }
+                let mut hint = XClassHint { res_name: std::ptr::null_mut(), res_class: std::ptr::null_mut() };
+                if x_get_class_hint(display, win, &mut hint) != 0 {
+                    let mut is_main = false;
+                    if !hint.res_class.is_null() {
+                        let class = CStr::from_ptr(hint.res_class).to_string_lossy().to_ascii_lowercase();
+                        let res_name = if !hint.res_name.is_null() {
+                            CStr::from_ptr(hint.res_name).to_string_lossy().to_ascii_lowercase()
+                        } else {
+                            String::new()
+                        };
+                        if class.contains("soundcraft") && !res_name.contains("plugin") {
+                            is_main = true;
+                        }
+                    }
+                    if !hint.res_name.is_null() {
+                        x_free(hint.res_name.cast());
+                    }
+                    if !hint.res_class.is_null() {
+                        x_free(hint.res_class.cast());
+                    }
+                    if is_main {
+                        found = Some(win);
+                    }
+                }
+            }
+            x_free(children.cast());
+            found
+        }
+    }
+
+    pub fn on_main_thread() -> bool {
+        std::thread::current().name() == Some("main")
+    }
+}
+
 /// Other platforms: no editor windows yet (opening reports "unsupported").
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod window {
     use std::ffi::{c_char, c_void};
 
@@ -2161,6 +3276,38 @@ mod tests {
         assert_eq!((c.projectTimeSamples, c.projectTimeMusic, c.barPositionMusic), (96_000, 3.5, 3.0));
         apply_transport(&mut c, &Transport { playing: false, ..t });
         assert_eq!(c.state & playing, 0);
+    }
+
+    #[test]
+    fn destroying_an_instance_waits_for_the_worker_that_closes_its_editor() {
+        // The editor's `IPlugView::removed()` runs on a worker thread. Releasing the controller and
+        // the component before it returns is a use-after-free inside the plugin, which took the app
+        // down without a panic; `kill` waits for the handshake first.
+        let link = EditorLink { audio_busy: std::sync::atomic::AtomicBool::new(false), inner: Mutex::new(EditorInner::default()) };
+        let closing = std::sync::Arc::new(Closing::default());
+        link.lock().closing = Some(std::sync::Arc::clone(&closing));
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            closing.finish();
+        });
+        let started = std::time::Instant::now();
+        let leaked = link.kill();
+        let waited = started.elapsed();
+        worker.join().expect("worker");
+        assert!(!leaked, "an editor that closes in time is not leaked");
+        assert!(waited >= std::time::Duration::from_millis(100), "kill returned before the view was detached ({waited:?})");
+        assert!(link.lock().closing.is_none(), "the handshake is consumed");
+    }
+
+    #[test]
+    fn an_editor_that_never_closes_is_leaked_instead_of_released_under_the_worker() {
+        let link = EditorLink { audio_busy: std::sync::atomic::AtomicBool::new(false), inner: Mutex::new(EditorInner::default()) };
+        // No one ever reports the close (a plugin stuck in `removed()`).
+        link.lock().closing = Some(std::sync::Arc::new(Closing::default()));
+        let started = std::time::Instant::now();
+        let leaked = link.kill();
+        assert!(leaked, "the plugin objects are kept alive, and the caller is told why");
+        assert!(started.elapsed() >= CLOSE_VIEW_WAIT, "kill gives the worker its full budget");
     }
 
     #[test]

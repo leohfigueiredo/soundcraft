@@ -42,7 +42,7 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
         ));
     }
     let plugin = str_param(p, "plugin").ok_or_else(|| bad("mix.instrument", "`plugin` required"))?;
-    let info = super::clap::plugin_info(plugin).ok_or_else(|| bad("mix.instrument", format!("unknown plugin `{plugin}`")))?;
+    let info = super::clap::plugin_meta(plugin).ok_or_else(|| bad("mix.instrument", format!("unknown plugin `{plugin}`")))?;
     if !info.is_instrument {
         return Err(bad("mix.instrument", format!("`{plugin}` is not an instrument")));
     }
@@ -69,6 +69,7 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     if let Some(tr) = e.session_mut().track_mut(t) {
         tr.instrument = Some(ins);
+        tr.name = info.name.to_string();
     }
     Ok(json!({"track": t, "plugin": info.id}))
 }

@@ -271,7 +271,18 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
-            Ok(saved) if recording || origin_saved.is_none_or(|o| saved > o) => {
+            Ok(saved)
+                if recording
+                    || origin_saved.is_none_or(|origin_saved| {
+                        saved > origin_saved
+                            || (saved == origin_saved
+                                && !origin
+                                    .as_deref()
+                                    .map(Path::new)
+                                    .and_then(|origin| autosave_matches_origin(&dir.join(SESSION), origin))
+                                    .unwrap_or(false))
+                    }) =>
+            {
                 let text = std::fs::read_to_string(dir.join(SESSION)).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
@@ -284,6 +295,21 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
     }
     out.sort_by_key(|l| std::cmp::Reverse(l.saved));
     out
+}
+
+fn autosave_matches_origin(autosave: &Path, origin: &Path) -> Option<bool> {
+    let mut autosaved = Session::from_json(&std::fs::read_to_string(autosave).ok()?).ok()?;
+    let mut original = Session::from_json(&std::fs::read_to_string(origin).ok()?).ok()?;
+    let base = origin.parent()?;
+    for session in [&mut autosaved, &mut original] {
+        for source in &mut session.sources {
+            let path = Path::new(&source.path);
+            if path.is_relative() {
+                source.path = base.join(path).to_string_lossy().into_owned();
+            }
+        }
+    }
+    Some(autosaved == original)
 }
 
 /// Open `left` as an unsaved version of the session it came from, so Save writes it back there,
@@ -454,6 +480,8 @@ mod tests {
         a.write(e.session(), e.path.as_deref(), None).unwrap();
         a.write(e.session(), e.path.as_deref(), None).unwrap();
         assert_eq!(std::fs::read_dir(a.dir.join("Audio Files")).unwrap().count(), 1);
+        let autosave_time = std::fs::metadata(a.dir.join(SESSION)).unwrap().modified().unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(autosave_time)).unwrap();
         drop(a);
         let left = leftovers(&dir.join("Autosave"));
         let mut r = Engine::default();
@@ -461,6 +489,22 @@ mod tests {
         let paths: Vec<_> = r.session().sources.iter().map(|s| (s.path.starts_with("Audio Files/"), s.unsaved)).collect();
         assert_eq!(paths, [(true, false), (false, true)]);
         assert_eq!(levels(&r), [0.5, -0.25]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchanged_autosave_with_matching_timestamp_is_discarded() {
+        let dir = folder("autosave-unchanged");
+        let path = dir.join("Song.scraft");
+        let mut e = Engine::default();
+        crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
+        let mut a = Autosave::create(&dir.join("Autosave"), "Song").unwrap();
+        a.write(e.session(), e.path.as_deref(), None).unwrap();
+        let autosave_time = std::fs::metadata(a.dir.join(SESSION)).unwrap().modified().unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(autosave_time)).unwrap();
+        drop(a);
+
+        assert!(leftovers(&dir.join("Autosave")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

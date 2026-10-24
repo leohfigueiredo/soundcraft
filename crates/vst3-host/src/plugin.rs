@@ -1,7 +1,7 @@
 //! `Vst3Plugin`: a loaded VST3 instance behind the safe `soundcraft_dsp::Plugin` trait.
 
-use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND};
-use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport, Unit};
+use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND, PROGRAM_CHANGE};
+use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProgramList, Transport, Unit};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use vst3::ComWrapper;
@@ -212,6 +212,45 @@ impl Plugin for Vst3Plugin {
         }
     }
 
+    fn program_lists(&self) -> Vec<ProgramList> {
+        self.inst.program_lists()
+    }
+
+    fn program_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginProgramReader>> {
+        let link = self.inst.state_link();
+        Some(Box::new(move || link.program_lists()))
+    }
+
+    fn select_program(&mut self, list: usize, program: usize) -> bool {
+        // The VST3 way first: the controller's program-change parameter, forwarded to the
+        // processor with the next block (a separate controller does not share state with it).
+        match self.inst.select_program(list, program) {
+            Ok((id, normalized)) => {
+                if let Some(pos) = self.ids.iter().position(|&vid| vid == id) {
+                    if let Some(slot) = self.values.get_mut(pos) {
+                        *slot = program as f32;
+                    }
+                }
+                if let Some(e) = self.pending.iter_mut().find(|(pid, _)| *pid == id) {
+                    e.1 = normalized;
+                } else if self.pending.len() < self.pending.capacity() {
+                    self.pending.push((id, normalized));
+                }
+                self.refresh_values();
+                true
+            }
+            Err(e) => {
+                // Best effort for the plugins that only listen to a MIDI program change: queue one
+                // for the next block, and say plainly that the parameter path was not available.
+                log::info!("vst3: {e}; sending a MIDI program change instead");
+                if program <= 127 {
+                    self.midi(0, [0xC0, program as u8, 0]);
+                }
+                false
+            }
+        }
+    }
+
     fn reset(&mut self) {
         self.notes.clear();
         self.controls.clear();
@@ -263,6 +302,10 @@ impl Plugin for Vst3Plugin {
         for c in &mut self.controls {
             c.0 = c.0.min(last);
         }
+        // The GUI run loop must not run while this instance is inside the plugin: the two calls
+        // wait for each other inside the bridge (see `EditorLink::audio_busy`). The guard covers the
+        // whole block loop and clears the flag however this function returns.
+        let _busy = self.inst.busy_guard();
         let mut start = 0usize;
         while start < frames {
             let n = (frames - start).min(self.max_block);
@@ -358,6 +401,12 @@ impl Plugin for Vst3Plugin {
             0xB0 => (usize::from(d1), f64::from(d2) / 127.0),
             0xD0 => (AFTERTOUCH, f64::from(d1) / 127.0),
             0xE0 => (PITCH_BEND, f64::from(u16::from(d2) << 7 | u16::from(d1)) / 16383.0),
+            0xC0 => {
+                if self.select_program(0, d1 as usize) {
+                    return;
+                }
+                (PROGRAM_CHANGE, f64::from(d1) / 127.0)
+            }
             0xA0 if self.event_input => {
                 self.push_note(NoteEvent::Pressure { time, key: d1, pressure: f32::from(d2) / 127.0 });
                 return;

@@ -38,6 +38,10 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.metadata", "Metadata Inspector", "Window > Metadata Inspector", None),
     ("window.event_list", "MIDI Event List", "Window > MIDI Event List", Some("Alt+=")),
     ("window.midi_keyboard", "MIDI Keyboard", "Window > MIDI Keyboard", Some("Shift+K")),
+    ("window.mixer_dock", "Mixer Dock", "Window > Mixer Dock", None),
+    ("window.midi_monitor", "MIDI Monitor", "Window > MIDI Monitor", None),
+    ("window.midi_devices", "MIDI Devices", "Window > MIDI Devices", None),
+    ("window.fx_browser", "Track FX Browser", "Window > Track FX Browser", Some("Shift+F")),
     ("window.workspace", "Workspace", "Window > New Workspace > Default", Some("Alt+I")),
     ("window.workspace_presets", "Workspace", "Window > New Workspace > Track Presets", None),
     ("window.workspace_sounds", "Workspace", "Window > New Workspace > Soundbase", None),
@@ -67,6 +71,28 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.playback_engine", "Playback Engine", "", None),
     ("ui.audio_device", "Audio Device", "", None),
     ("window.io_setup", "I/O Setup", "", None),
+    ("window.msc_hardware", "DAW Controllers & Mackie Setup", "Setup > Hardware > DAW Controller Setup (iCON / M-Vave)...", None),
+    ("window.console.track", "Alternative GUI for This Track", "Window > Alternative GUI > This Track", Some("Shift+Alt+P")),
+    ("window.console", "Instrument Console (Alternative GUI)", "Window > Instrument Console (Alternative GUI)", Some("Shift+P")),
+    ("window.console.pianoteq", "Pianoteq Console", "", None),
+    ("window.console.pigments", "Pigments Console", "", None),
+    ("window.console.omnisphere", "Omnisphere Console", "", None),
+    ("window.console.kontakt", "Kontakt Console", "", None),
+    ("window.console.analoglab", "Analog Lab Console", "", None),
+    ("window.console.labs", "LABS Console", "", None),
+    ("controller.rescan", "Rescan MIDI Ports", "Setup > Hardware > Rescan MIDI Ports", None),
+    ("controller.midi_ports", "MIDI Input Ports", "", None),
+    ("controller.keyboard", "Connect MIDI Keyboard", "", None),
+    ("controller.keyboard_auto", "Auto-Connect MIDI Keyboard", "", None),
+    ("controller.ble", "Bluetooth (BLE-MIDI) Link", "", None),
+    ("controller.surface", "Use MIDI Port as Control Surface", "", None),
+    ("controller.mode", "Control Surface Mode (Global / Linked)", "", None),
+    ("controller.soft_takeover", "Soft Takeover (Fader Pickup)", "", None),
+    ("controller.learn", "MIDI Learn…", "", None),
+    ("controller.cancel_learn", "Cancel MIDI Learn", "", None),
+    ("controller.clear_learn", "Clear Learned Controls", "", None),
+    ("controller.status", "Control Surface Status", "", None),
+    ("window.vst_folders", "VST / CLAP Plugin Folders", "Setup > Hardware > VST & CLAP Plugin Folders...", None),
     ("window.shortcuts", "Keyboard Shortcuts", "", None),
     ("view.mix_section", "Mix Window View", "", None),
     ("ui.new_tracks_dialog", "New Tracks…", "", None),
@@ -202,6 +228,8 @@ pub fn tree() -> Vec<MenuNode> {
         insert_path(&mut roots, line);
     }
     insert_path(&mut roots, "Window > Reset Panel Layout");
+    insert_path(&mut roots, "Window > MIDI Monitor");
+    insert_path(&mut roots, "Window > MIDI Devices");
     // Not in the incumbent catalog, but the only UI path to an empty MIDI clip (#282).
     // It creates a clip rather than acting on the selected ones, so it leads the Clip menu.
     insert_path(&mut roots, "Clip > New MIDI Clip");
@@ -270,6 +298,112 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(title).color(t.text_dim));
+                    ui.separator();
+                    let cur_name = match app.ui.theme {
+                        crate::theme::ThemeMode::Dark => "Dark Studio",
+                        crate::theme::ThemeMode::FLStudio => "FL Studio (Charcoal & Neon)",
+                        crate::theme::ThemeMode::StudioPro => "Studio Pro (Black Piano)",
+                        crate::theme::ThemeMode::Light => "Clean Light",
+                        crate::theme::ThemeMode::Cyberpunk => "Cyberpunk / Neon",
+                        crate::theme::ThemeMode::Vintage => "Vintage Console",
+                        crate::theme::ThemeMode::System => "System",
+                    };
+                    egui::ComboBox::from_id_salt("theme_quick_select").selected_text(cur_name).show_ui(ui, |ui| {
+                        for (mode, label) in [
+                            (crate::theme::ThemeMode::FLStudio, "FL Studio (Charcoal & Neon)"),
+                            (crate::theme::ThemeMode::Dark, "Dark Studio"),
+                            (crate::theme::ThemeMode::StudioPro, "Studio Pro (Black Piano)"),
+                            (crate::theme::ThemeMode::Light, "Clean Light"),
+                            (crate::theme::ThemeMode::Cyberpunk, "Cyberpunk / Neon"),
+                            (crate::theme::ThemeMode::Vintage, "Vintage Console"),
+                            (crate::theme::ThemeMode::System, "System"),
+                        ] {
+                            if ui.selectable_label(app.ui.theme == mode, label).clicked() {
+                                app.ui.theme = mode;
+                                let _ = app.run("ui.theme", json!({"mode": mode.id()}));
+                            }
+                        }
+                    });
+                    ui.label(egui::RichText::new("Theme:").small().color(t.text_dim));
+                    ui.separator();
+                    // Controller state, always visible: a dot that goes bright on input, plus the
+                    // keyboard. Clicking opens the setup window.
+                    let now = ui.input(|i| i.time);
+                    use crate::midi_io::LinkState;
+                    let (icon, label, col) = match app.msc.link.state {
+                        LinkState::Connected => {
+                            let port = app.msc.link.port_name.replace("SoundCraft ", "");
+                            let name = if port.is_empty() { "MCU".to_string() } else { port };
+                            ("🎛", name, egui::Color32::from_rgb(0, 220, 130))
+                        }
+                        LinkState::Searching => ("🎛", "MCU: no port".to_string(), t.meter_yellow),
+                        LinkState::Unavailable => ("🎛", "MCU: no MIDI".to_string(), t.meter_red),
+                    };
+                    let flash = app.msc.input_active(now, 0.6);
+                    if ui
+                        .small_button(egui::RichText::new(format!("{}{icon} {label}", if flash { "● " } else { "" })).color(col))
+                        .on_hover_text("MIDI controller: click for setup, faders, MIDI Learn and the input monitor")
+                        .clicked()
+                    {
+                        app.ui.show_msc_hardware = !app.ui.show_msc_hardware;
+                    }
+                    let (kb_icon, kb_label, kb_col) = match app.msc.link.keyboard_state {
+                        LinkState::Connected => {
+                            let name = app.msc.keyboard_port.clone().unwrap_or_else(|| "MIDI keyboard".to_string());
+                            ("🎹", name, egui::Color32::from_rgb(0, 220, 130))
+                        }
+                        LinkState::Searching => ("🎹", "no keyboard".to_string(), t.text_dim),
+                        LinkState::Unavailable => ("🎹", "no MIDI".to_string(), t.meter_red),
+                    };
+                    ui.small_button(egui::RichText::new(format!("{kb_icon} {kb_label}")).color(kb_col))
+                        .on_hover_text("MIDI keyboard: notes play the selected instrument track");
+                    ui.separator();
+                    // FL Studio style quick-dock buttons: Piano (F7), Plugins (F8), Mixer (F9)
+                    let piano_btn = egui::Button::new(egui::RichText::new("🎹 Piano (F7)").color(if app.ui.show_midi_keyboard {
+                        egui::Color32::BLACK
+                    } else {
+                        t.text
+                    }))
+                    .fill(if app.ui.show_midi_keyboard { t.accent } else { t.button });
+                    if ui.add(piano_btn).on_hover_text("Show or hide the virtual master keyboard (F7)").clicked() {
+                        app.ui.show_midi_keyboard = !app.ui.show_midi_keyboard;
+                    }
+
+                    let plug_btn = egui::Button::new(egui::RichText::new("🎛 Plugins (F8)").color(if app.ui.show_vst_folders {
+                        egui::Color32::BLACK
+                    } else {
+                        t.text
+                    }))
+                    .fill(if app.ui.show_vst_folders { t.accent } else { t.button });
+                    if ui.add(plug_btn).on_hover_text("Open the VST3/CLAP plugin manager and search folders (F8)").clicked() {
+                        app.ui.show_vst_folders = !app.ui.show_vst_folders;
+                    }
+
+                    // The alternative console: one window, an instrument tab row inside, always
+                    // one click away (and Shift+P) so it is found without opening the dock.
+                    let any_open = app.ui.show_console;
+                    ui.menu_button(egui::RichText::new("🎹 ALT GUI ▾").color(if any_open { t.accent } else { t.text }), |ui| {
+                        ui.set_min_width(260.0);
+                        let current = app.ui.console_profile.clone();
+                        for profile in crate::console_kit::profiles() {
+                            let mark = if app.ui.show_console && current == profile.id { "✔ " } else { "   " };
+                            if ui.button(format!("{mark}{} console", profile.name)).clicked() {
+                                crate::console_kit::open(app, profile.id);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Close the console").clicked() {
+                            app.ui.show_console = false;
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Alternative rack-style GUI for the hosted instruments (Shift+P)");
+
+                    // The mixer lives in the dock under the timeline now; F9 still opens the full
+                    // console, but there is no "switch windows" button in the way.
+                    let _ = MainWindow::Mix;
                 });
             });
         },
@@ -413,6 +547,7 @@ const MENU_WINDOWS: &[(&str, &str)] = &[
     ("Setup > I/O...", "window.io_setup"),
     ("Setup > Keyboard Shortcuts...", "window.shortcuts"),
     ("Setup > Session", "setup.session"),
+    ("Setup > Preferences...", "window.vst_folders"),
     ("Event > Beat Detective", "window.beat_detective"),
     ("Event > Tempo Operations > Tempo Operations Window", "window.tempo_ops"),
     ("Event > Time Operations > Time Operations Window", "window.time_ops"),
@@ -547,6 +682,155 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         "window.rtp" => toggle(&mut app.ui.show_rtp),
         "window.playback_engine" => toggle(&mut app.ui.show_playback_engine),
         "window.io_setup" => toggle(&mut app.ui.show_io_setup),
+        "window.msc_hardware" => toggle(&mut app.ui.show_msc_hardware),
+        "window.console" => toggle(&mut app.ui.show_console),
+        "window.console.track" => {
+            // The console of whatever instrument the selected track holds.
+            let track = app.engine.session().edit.selected_tracks.first().copied().or_else(|| crate::virtual_keyboard::active_target_track(app));
+            match track {
+                Some(track) => {
+                    crate::console_kit::open_for_track(app, track);
+                    json!({"console": app.ui.console_profile, "track": track.0})
+                }
+                None => json!({"console": null, "track": null}),
+            }
+        }
+        id if id.starts_with("window.console.") => {
+            // One console window, each command picks the instrument it shows.
+            let which = id.trim_start_matches("window.console.");
+            if crate::console_kit::profile(which).is_some() {
+                crate::console_kit::open(app, which);
+                json!({"console": which})
+            } else {
+                json!({"console": null})
+            }
+        }
+        "controller.rescan" => {
+            app.control_surface_rescan();
+            json!({"link": app.msc.link.state.label()})
+        }
+        "controller.midi_ports" => {
+            let ports: Vec<Value> = app
+                .msc
+                .link
+                .ports
+                .iter()
+                .map(|p| json!({"name": p.name, "address": p.address, "surface": p.matched, "keyboard": app.msc.keyboard_port.as_deref() == Some(p.name.as_str())}))
+                .collect();
+            json!({
+                "ports": ports,
+                "keyboard": app.msc.keyboard_port,
+                "keyboard_state": app.msc.link.keyboard_state.label(),
+                "surface": app.msc.link.state.label(),
+            })
+        }
+        "controller.keyboard" => {
+            let port = p.get("port").and_then(Value::as_str).map(str::to_string);
+            if !p.as_object().is_some_and(|o| o.contains_key("port")) {
+                return Some(Err("controller.keyboard: `port` required (use {\"port\": null} to disconnect)".to_string()));
+            }
+            app.control_surface_keyboard(port.clone());
+            app.control_surface_rescan();
+            json!({"keyboard": port})
+        }
+        "controller.surface" => {
+            let port = p.get("port").and_then(Value::as_str).map(str::to_string);
+            app.control_surface_port(port.clone());
+            app.control_surface_rescan();
+            json!({"surface": port})
+        }
+        "controller.ble" => {
+            let value = p.get("value").and_then(Value::as_bool).unwrap_or(!app.msc.ble);
+            app.control_surface_ble(value);
+            json!({"ble": value})
+        }
+        "controller.keyboard_auto" => {
+            // The usual piano names: a Casio CDP-S160, a Yamaha, a Roland... but never the
+            // control surface itself.
+            let pick = app
+                .msc
+                .link
+                .ports
+                .iter()
+                .find(|p| {
+                    !p.matched
+                        && ["casio", "cdp", "piano", "keyboard", "yamaha", "roland", "kawai", "nord", "arturia", "midi"]
+                            .iter()
+                            .any(|a| p.name.to_ascii_lowercase().contains(a))
+                })
+                .map(|p| p.name.clone());
+            match pick {
+                Some(name) => {
+                    app.control_surface_keyboard(Some(name.clone()));
+                    app.control_surface_rescan();
+                    json!({"keyboard": name})
+                }
+                None => return Some(Err("controller.keyboard_auto: no MIDI keyboard port found (plug the piano in, run Rescan)".to_string())),
+            }
+        }
+        "controller.mode" => {
+            use crate::msc_mixer::MscMode;
+            let mode = match p.get("mode").and_then(Value::as_str).and_then(|m| match m.to_ascii_lowercase().as_str() {
+                "global" => Some(MscMode::Global),
+                "linked" | "link" => Some(MscMode::Linked),
+                _ => None,
+            }) {
+                Some(m) => m,
+                None => match app.msc.mode {
+                    MscMode::Global => MscMode::Linked,
+                    MscMode::Linked => MscMode::Global,
+                },
+            };
+            app.msc.mode = mode;
+            app.msc.reset_pickups();
+            json!({"mode": format!("{:?}", mode).to_ascii_lowercase()})
+        }
+        "controller.soft_takeover" => {
+            let value = p.get("value").and_then(Value::as_bool).unwrap_or(!app.msc.config.soft_takeover);
+            app.msc.config.soft_takeover = value;
+            app.msc.reset_pickups();
+            json!({"value": value})
+        }
+        "controller.learn" => {
+            use crate::msc_mixer::LearnTarget;
+            let track = p.get("track").and_then(Value::as_u64).or_else(|| app.engine.session().edit.selected_tracks.first().map(|t| t.0));
+            let Some(track) = track else {
+                return Some(Err("controller.learn: no track selected".to_string()));
+            };
+            let target = match p.get("target").and_then(Value::as_str).unwrap_or("volume").to_ascii_lowercase().as_str() {
+                "pan" => LearnTarget::Pan { track, index: 0 },
+                "volume" | "fader" => LearnTarget::Volume { track },
+                other => return Some(Err(format!("controller.learn: unknown target `{other}` (volume, pan)"))),
+            };
+            let described = target.describe();
+            app.msc.learn_start(target);
+            json!({"armed": true, "target": described})
+        }
+        "controller.cancel_learn" => {
+            let was = app.msc.learn.take().is_some();
+            json!({"cancelled": was})
+        }
+        "controller.clear_learn" => {
+            let n = app.msc.bindings.len();
+            app.msc.learn_clear(None);
+            json!({"removed": n})
+        }
+        "controller.status" => {
+            let bindings: Vec<Value> = app.msc.bindings.iter().map(|b| json!({"control": b.describe(), "target": b.target.describe()})).collect();
+            json!({
+                "link": app.msc.link.state.label(),
+                "backend": app.msc.link.backend,
+                "port": app.msc.link.port_name,
+                "mode": app.msc.mode.label(),
+                "soft_takeover": app.msc.config.soft_takeover,
+                "learn_armed": app.msc.learn.as_ref().map(crate::msc_mixer::LearnTarget::describe),
+                "bindings": bindings,
+                "received": app.msc.link.received,
+                "sent": app.msc.link.sent,
+                "reconnects": app.msc.link.reconnects,
+            })
+        }
+        "window.vst_folders" => toggle(&mut app.ui.show_vst_folders),
         "window.shortcuts" => toggle(&mut app.ui.show_shortcuts),
         "window.color_palette" => toggle(&mut app.ui.show_color_palette),
         "window.disk_usage" => toggle(&mut app.ui.show_disk_usage),
@@ -555,6 +839,19 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         "window.metadata" => toggle(&mut app.ui.show_metadata),
         "window.event_list" => toggle(&mut app.ui.show_event_list),
         "window.midi_keyboard" => toggle(&mut app.ui.show_midi_keyboard),
+        "window.mixer_dock" => toggle(&mut app.ui.show_mixer_dock),
+        "window.midi_monitor" => toggle(&mut app.ui.show_midi_monitor),
+        "window.midi_devices" => toggle(&mut app.ui.show_midi_devices),
+        "window.fx_browser" => {
+            if app.ui.show_fx_browser.is_some() {
+                app.ui.show_fx_browser = None;
+                json!({"value": false})
+            } else {
+                let target = app.engine.session().edit.selected_tracks.first().copied().or_else(|| app.engine.session().tracks.first().map(|t| t.id));
+                app.ui.show_fx_browser = target;
+                json!({"value": target.is_some()})
+            }
+        }
         "window.workspace" | "window.workspace_presets" | "window.workspace_sounds" | "window.workspace_front" => {
             app.ui.show_workspace = true;
             json!({"value": true})
@@ -633,7 +930,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
                 return Some(Ok(json!({"mode": app.ui.theme.id()})));
             };
             let Some(mode) = crate::theme::ThemeMode::parse(mode) else {
-                return Some(Err(format!("unknown theme `{mode}` (system, light or dark)")));
+                return Some(Err(format!("unknown theme `{mode}` (system, light, dark, studiopro, cyberpunk, vintage)")));
             };
             app.ui.theme = mode;
             json!({"mode": mode.id()})
@@ -683,6 +980,18 @@ mod tests {
         let b = second.iter().find(|(path, _)| path.contains("Mix Window Views > All")).map(|(path, _)| *path).unwrap();
         assert!(std::ptr::eq(a, b));
         assert_eq!(first.iter().filter(|(path, _)| path.contains("Mix Window Views")).count(), 14);
+    }
+
+    #[test]
+    fn midi_monitor_and_devices_are_available_in_the_window_menu() {
+        let roots = tree();
+        let window = roots.iter().find(|node| node.label == "Window").unwrap();
+        for (label, path, command) in
+            [("MIDI Monitor", "Window > MIDI Monitor", "window.midi_monitor"), ("MIDI Devices", "Window > MIDI Devices", "window.midi_devices")]
+        {
+            assert!(window.children.iter().any(|node| node.label == label), "{label} is missing");
+            assert_eq!(command_for_path(path, &ui_aliases()).as_deref(), Some(command));
+        }
     }
 
     #[test]

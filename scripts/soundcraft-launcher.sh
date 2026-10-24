@@ -1,0 +1,1 @@
+../packaging/linux/soundcraft-launcher.sh

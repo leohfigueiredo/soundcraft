@@ -133,8 +133,24 @@ pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Opt
     if output { host.default_output_device() } else { host.default_input_device() }
 }
 
-/// The buffer to request: the chosen size when the device's range allows it, else the default.
+/// The buffer requested when none was chosen, on systems whose "default" is the device's own
+/// (ALSA's can be tens of thousands of frames through a sound server): 512 frames, ≈11 ms at 48 kHz.
+pub const DEFAULT_BUFFER: u32 = 512;
+
+/// The nearest power of two to `n` inside the standard range (ties go up: fewer xruns).
+pub fn power_of_two_buffer(n: u32) -> u32 {
+    let (lo, hi) = (STANDARD_BUFFERS[0], STANDARD_BUFFERS[STANDARD_BUFFERS.len() - 1]);
+    let n = n.clamp(lo, hi);
+    let up = n.next_power_of_two().min(hi);
+    let down = (up / 2).max(lo);
+    if up - n <= n - down { up } else { down }
+}
+
+/// The buffer to request: the chosen size (as a power of two) when the device's range allows it,
+/// else the default.
 pub(crate) fn buffer_size(want: Option<u32>, supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    let unix_default = cfg!(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"));
+    let want = want.map(power_of_two_buffer).or(unix_default.then_some(DEFAULT_BUFFER));
     match (want, supported) {
         (Some(n), cpal::SupportedBufferSize::Range { min, max }) if (*min..=*max).contains(&n) => cpal::BufferSize::Fixed(n),
         // The device does not say: ask anyway (cpal reports an error if it cannot, and the caller
@@ -169,9 +185,22 @@ mod tests {
         assert_eq!(buffer_size(Some(256), &r), cpal::BufferSize::Fixed(256));
         assert_eq!(buffer_size(Some(32), &r), cpal::BufferSize::Default);
         assert_eq!(buffer_size(Some(4096), &r), cpal::BufferSize::Default);
-        assert_eq!(buffer_size(None, &r), cpal::BufferSize::Default);
+        let unchosen = if cfg!(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd")) {
+            cpal::BufferSize::Fixed(DEFAULT_BUFFER)
+        } else {
+            cpal::BufferSize::Default
+        };
+        assert_eq!(buffer_size(None, &r), unchosen);
+        // Odd sizes become powers of two.
+        assert_eq!(buffer_size(Some(300), &r), cpal::BufferSize::Fixed(256));
+        assert_eq!(buffer_size(Some(384), &r), cpal::BufferSize::Fixed(512));
         assert_eq!(buffer_size(Some(128), &cpal::SupportedBufferSize::Unknown), cpal::BufferSize::Fixed(128));
-        assert_eq!(buffer_size(Some(1 << 20), &cpal::SupportedBufferSize::Unknown), cpal::BufferSize::Default);
+        // A hostile size from a hand-edited config is clamped to the largest standard buffer.
+        assert_eq!(buffer_size(Some(1 << 20), &cpal::SupportedBufferSize::Unknown), cpal::BufferSize::Fixed(8192));
+        assert_eq!(
+            [0, 1, 16, 100, 128, 129, 192, 1000, 1024, 9000, u32::MAX].map(power_of_two_buffer),
+            [32, 32, 32, 128, 128, 128, 256, 1024, 1024, 8192, 8192]
+        );
         let d = DeviceInfo {
             name: "x".into(),
             is_default: true,

@@ -24,14 +24,19 @@ use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui, clap_plugin_gui, clap_wind
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::log::{CLAP_EXT_LOG, CLAP_LOG_ERROR, CLAP_LOG_FATAL, CLAP_LOG_WARNING, clap_host_log, clap_log_severity};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_note_port_info, clap_plugin_note_ports};
+use clap_sys::ext::posix_fd_support::{
+    CLAP_EXT_POSIX_FD_SUPPORT, CLAP_POSIX_FD_ERROR, CLAP_POSIX_FD_READ, CLAP_POSIX_FD_WRITE, clap_host_posix_fd_support, clap_plugin_posix_fd_support,
+    clap_posix_fd_flags,
+};
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, clap_host_params, clap_param_clear_flags, clap_param_info, clap_param_rescan_flags, clap_plugin_params,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
+use clap_sys::ext::timer_support::{CLAP_EXT_TIMER_SUPPORT, clap_host_timer_support, clap_plugin_timer_support};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::host::clap_host;
-use clap_sys::id::clap_id;
+use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::{CLAP_PROCESS_ERROR, clap_process};
 use clap_sys::stream::{clap_istream, clap_ostream};
@@ -42,6 +47,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Most plugins one factory may report (hostile-input cap).
 const MAX_PLUGINS_PER_FACTORY: u32 = 1024;
@@ -278,8 +284,11 @@ impl Bundle {
         inst.notes = inst.extension::<clap_plugin_note_ports>(CLAP_EXT_NOTE_PORTS);
         inst.state_ext = inst.extension::<clap_plugin_state>(CLAP_EXT_STATE);
         let gui = inst.extension::<clap_plugin_gui>(CLAP_EXT_GUI);
+        let timer_ext = inst.extension::<clap_plugin_timer_support>(CLAP_EXT_TIMER_SUPPORT);
+        let fd_ext = inst.extension::<clap_plugin_posix_fd_support>(CLAP_EXT_POSIX_FD_SUPPORT);
+        let inner = GuiInner { plugin, gui, state: inst.state_ext, alive: true, created: false, visible: false, window: None, timer_ext, fd_ext };
         inst.gui = Arc::new(GuiLink {
-            inner: Mutex::new(GuiInner { plugin, gui, state: inst.state_ext, alive: true, created: false, visible: false, window: None }),
+            inner: Mutex::new(inner),
             host: Arc::clone(&inst.state),
         });
         Ok(inst)
@@ -319,6 +328,10 @@ pub(crate) struct HostState {
     /// Parameter changes the plugin reported (output events: typically edits in its GUI),
     /// waiting for the UI. Bounded by `EDIT_CAP`; the audio thread only `try_lock`s it.
     pub edits: Mutex<Vec<(u32, f64)>>,
+    /// `clap.timer-support` registrations, fired by the editor's `idle` on the main thread.
+    pub timers: Mutex<TimerRegistry>,
+    /// `clap.posix-fd-support` registrations, polled by the editor's `idle` on the main thread.
+    pub fds: Mutex<FdRegistry>,
 }
 
 impl Default for HostState {
@@ -336,8 +349,229 @@ impl Default for HostState {
             gui_hide: AtomicBool::new(false),
             gui_resize: AtomicU64::new(0),
             edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
+            timers: Mutex::new(TimerRegistry::default()),
+            fds: Mutex::new(FdRegistry::default()),
         }
     }
+}
+
+// ---- host timers and file descriptors ------------------------------------------------------
+
+/// Most timers one plugin may register (hostile-input cap).
+pub(crate) const MAX_TIMERS: usize = 64;
+/// Most file descriptors one plugin may register (hostile-input cap).
+pub(crate) const MAX_FDS: usize = 64;
+/// Longest timer period we honour (an hour); shorter than 1 ms is raised to 1 ms.
+const MAX_TIMER_MS: u32 = 3_600_000;
+/// Every flag `clap.posix-fd-support` defines.
+const FD_FLAGS: clap_posix_fd_flags = CLAP_POSIX_FD_READ | CLAP_POSIX_FD_WRITE | CLAP_POSIX_FD_ERROR;
+
+/// One `clap_host_timer_support.register_timer` registration.
+#[derive(Debug, Clone, Copy)]
+struct HostTimer {
+    id: clap_id,
+    period: Duration,
+    next_due: Instant,
+}
+
+/// The timers one plugin instance registered. Plain data: the host callbacks edit it (under the
+/// `HostState` mutex) and the editor's `idle` asks which are due, then calls the plugin with no
+/// lock held (a timer callback may register or unregister timers).
+#[derive(Debug, Default)]
+pub(crate) struct TimerRegistry {
+    timers: Vec<HostTimer>,
+    next_id: clap_id,
+}
+
+impl TimerRegistry {
+    /// Registers a timer firing every `period_ms` (clamped to 1 ms ..= 1 h), first due one period
+    /// after `now`. `None` when the cap is reached.
+    pub fn register(&mut self, period_ms: u32, now: Instant) -> Option<clap_id> {
+        if self.timers.len() >= MAX_TIMERS {
+            return None;
+        }
+        // Fewer than `MAX_TIMERS` ids are in use, so a free one is among the next few.
+        let mut id = self.next_id;
+        for _ in 0..=MAX_TIMERS {
+            if id != CLAP_INVALID_ID && !self.contains(id) {
+                break;
+            }
+            id = id.wrapping_add(1);
+        }
+        if id == CLAP_INVALID_ID || self.contains(id) {
+            return None;
+        }
+        self.next_id = id.wrapping_add(1);
+        let period = Duration::from_millis(u64::from(period_ms.clamp(1, MAX_TIMER_MS)));
+        self.timers.push(HostTimer { id, period, next_due: now.checked_add(period).unwrap_or(now) });
+        Some(id)
+    }
+
+    /// Forgets a timer; `false` when it was not registered.
+    pub fn unregister(&mut self, id: clap_id) -> bool {
+        let before = self.timers.len();
+        self.timers.retain(|t| t.id != id);
+        self.timers.len() != before
+    }
+
+    pub fn contains(&self, id: clap_id) -> bool {
+        self.timers.iter().any(|t| t.id == id)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.timers.len()
+    }
+
+    /// The timers due at `now`, each rescheduled one period later. A timer fires at most once
+    /// per call: ticks missed while the UI was stalled are not replayed.
+    pub fn due(&mut self, now: Instant) -> Vec<clap_id> {
+        let mut out = Vec::new();
+        for t in &mut self.timers {
+            if t.next_due <= now {
+                t.next_due = now.checked_add(t.period).unwrap_or(now);
+                out.push(t.id);
+            }
+        }
+        out
+    }
+
+    pub fn clear(&mut self) {
+        self.timers.clear();
+    }
+}
+
+/// The file descriptors one plugin instance registered, with the events it wants for each.
+#[derive(Debug, Default)]
+pub(crate) struct FdRegistry {
+    fds: Vec<(i32, clap_posix_fd_flags)>,
+}
+
+impl FdRegistry {
+    /// `false` for a negative fd, one already registered, or past the cap. Unknown flag bits are
+    /// dropped.
+    pub fn register(&mut self, fd: i32, flags: clap_posix_fd_flags) -> bool {
+        if fd < 0 || self.flags(fd).is_some() || self.fds.len() >= MAX_FDS {
+            return false;
+        }
+        self.fds.push((fd, flags & FD_FLAGS));
+        true
+    }
+
+    /// Changes the events wanted for a registered fd; `false` when it is not registered.
+    pub fn modify(&mut self, fd: i32, flags: clap_posix_fd_flags) -> bool {
+        match self.fds.iter_mut().find(|(f, _)| *f == fd) {
+            Some(e) => {
+                e.1 = flags & FD_FLAGS;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn unregister(&mut self, fd: i32) -> bool {
+        let before = self.fds.len();
+        self.fds.retain(|(f, _)| *f != fd);
+        self.fds.len() != before
+    }
+
+    /// The flags a registered fd waits for (`None` when not registered).
+    pub fn flags(&self, fd: i32) -> Option<clap_posix_fd_flags> {
+        self.fds.iter().find(|(f, _)| *f == fd).map(|&(_, fl)| fl)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.fds.len()
+    }
+
+    pub fn snapshot(&self) -> Vec<(i32, clap_posix_fd_flags)> {
+        self.fds.clone()
+    }
+
+    pub fn clear(&mut self) {
+        self.fds.clear();
+    }
+}
+
+/// `poll(2)` event bits (identical on Linux, the BSDs and macOS) and their CLAP translation.
+#[cfg_attr(not(unix), allow(dead_code))]
+mod pollbits {
+    use clap_sys::ext::posix_fd_support::{CLAP_POSIX_FD_ERROR, CLAP_POSIX_FD_READ, CLAP_POSIX_FD_WRITE, clap_posix_fd_flags};
+
+    pub const POLLIN: i16 = 0x001;
+    pub const POLLPRI: i16 = 0x002;
+    pub const POLLOUT: i16 = 0x004;
+    pub const POLLERR: i16 = 0x008;
+    pub const POLLHUP: i16 = 0x010;
+    pub const POLLNVAL: i16 = 0x020;
+
+    /// The `poll` events to ask for, for the CLAP flags a plugin registered.
+    pub fn events_for(flags: clap_posix_fd_flags) -> i16 {
+        let mut ev = 0;
+        if flags & CLAP_POSIX_FD_READ != 0 {
+            ev |= POLLIN | POLLPRI;
+        }
+        if flags & CLAP_POSIX_FD_WRITE != 0 {
+            ev |= POLLOUT;
+        }
+        ev
+    }
+
+    /// The CLAP flags to report for `revents`, limited to what the plugin registered for (a
+    /// hang-up reads as readable: the plugin's read then sees the end of the stream).
+    pub fn ready_flags(registered: clap_posix_fd_flags, revents: i16) -> clap_posix_fd_flags {
+        let mut f = 0;
+        if revents & (POLLIN | POLLPRI | POLLHUP) != 0 {
+            f |= CLAP_POSIX_FD_READ;
+        }
+        if revents & POLLOUT != 0 {
+            f |= CLAP_POSIX_FD_WRITE;
+        }
+        if revents & (POLLERR | POLLNVAL) != 0 {
+            f |= CLAP_POSIX_FD_ERROR;
+        }
+        f & registered
+    }
+}
+
+/// Polls the descriptors with a zero timeout; returns the ready ones with the CLAP flags to report.
+#[cfg(unix)]
+fn poll_fds(fds: &[(i32, clap_posix_fd_flags)]) -> Vec<(i32, clap_posix_fd_flags)> {
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    type NfdsT = std::ffi::c_ulong;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    type NfdsT = std::ffi::c_uint;
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    if fds.is_empty() {
+        return Vec::new();
+    }
+    let mut set: Vec<PollFd> = fds.iter().take(MAX_FDS).map(|&(fd, fl)| PollFd { fd, events: pollbits::events_for(fl), revents: 0 }).collect();
+    let Ok(n) = NfdsT::try_from(set.len()) else { return Vec::new() };
+    // SAFETY: `set` is a valid array of `n` pollfd structs; zero timeout; nothing is retained.
+    if unsafe { poll(set.as_mut_ptr(), n, 0) } <= 0 {
+        return Vec::new();
+    }
+    set.iter()
+        .zip(fds)
+        .filter_map(|(p, &(fd, fl))| {
+            let f = pollbits::ready_flags(fl, p.revents);
+            (f != 0).then_some((fd, f))
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn poll_fds(_fds: &[(i32, clap_posix_fd_flags)]) -> Vec<(i32, clap_posix_fd_flags)> {
+    Vec::new()
 }
 
 /// SAFETY contract: `host` is null or one of our `clap_host` structs, whose `host_data` points
@@ -460,6 +694,47 @@ unsafe extern "C" fn host_gui_closed(host: *const clap_host, was_destroyed: bool
     }
 }
 
+unsafe extern "C" fn host_register_timer(host: *const clap_host, period_ms: u32, timer_id: *mut clap_id) -> bool {
+    if timer_id.is_null() {
+        return false;
+    }
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    let id = unsafe { state(host) }.and_then(|s| s.timers.lock().unwrap_or_else(PoisonError::into_inner).register(period_ms, Instant::now()));
+    // SAFETY: non-null out-pointer the plugin provides for the call.
+    unsafe { *timer_id = id.unwrap_or(CLAP_INVALID_ID) };
+    id.is_some()
+}
+
+unsafe extern "C" fn host_unregister_timer(host: *const clap_host, timer_id: clap_id) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    unsafe { state(host) }.is_some_and(|s| s.timers.lock().unwrap_or_else(PoisonError::into_inner).unregister(timer_id))
+}
+
+unsafe extern "C" fn host_register_fd(host: *const clap_host, fd: i32, flags: clap_posix_fd_flags) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    unsafe { state(host) }.is_some_and(|s| s.fds.lock().unwrap_or_else(PoisonError::into_inner).register(fd, flags))
+}
+
+unsafe extern "C" fn host_modify_fd(host: *const clap_host, fd: i32, flags: clap_posix_fd_flags) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    unsafe { state(host) }.is_some_and(|s| s.fds.lock().unwrap_or_else(PoisonError::into_inner).modify(fd, flags))
+}
+
+unsafe extern "C" fn host_unregister_fd(host: *const clap_host, fd: i32) -> bool {
+    // SAFETY: the plugin passes back the host pointer we gave it.
+    unsafe { state(host) }.is_some_and(|s| s.fds.lock().unwrap_or_else(PoisonError::into_inner).unregister(fd))
+}
+
+static HOST_TIMERS: clap_host_timer_support =
+    clap_host_timer_support { register_timer: Some(host_register_timer), unregister_timer: Some(host_unregister_timer) };
+static HOST_FDS: clap_host_posix_fd_support =
+    clap_host_posix_fd_support { register_fd: Some(host_register_fd), modify_fd: Some(host_modify_fd), unregister_fd: Some(host_unregister_fd) };
+
+/// Timers and fds are served on X11 platforms only, where plugin GUIs have no event loop of their
+/// own to run them. On Windows and macOS plugins use the native run loop, which never stalls when
+/// the host's UI frame does.
+const SERVES_RUN_LOOP: bool = cfg!(all(unix, not(target_os = "macos")));
+
 static HOST_STATE: clap_host_state = clap_host_state { mark_dirty: Some(host_state_mark_dirty) };
 static HOST_GUI: clap_host_gui = clap_host_gui {
     resize_hints_changed: Some(host_gui_resize_hints_changed),
@@ -489,8 +764,12 @@ unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_ch
         (&HOST_STATE as *const clap_host_state).cast()
     } else if id == CLAP_EXT_GUI {
         (&HOST_GUI as *const clap_host_gui).cast()
+    } else if SERVES_RUN_LOOP && id == CLAP_EXT_TIMER_SUPPORT {
+        (&HOST_TIMERS as *const clap_host_timer_support).cast()
+    } else if SERVES_RUN_LOOP && id == CLAP_EXT_POSIX_FD_SUPPORT {
+        (&HOST_FDS as *const clap_host_posix_fd_support).cast()
     } else {
-        // Everything else (thread-check, timers, fd support, …) is unsupported: CLAP allows null.
+        // Everything else (thread-check, …) is unsupported: CLAP allows null.
         std::ptr::null()
     }
 }
@@ -752,6 +1031,9 @@ struct GuiInner {
     visible: bool,
     /// The host window of an embedded editor (`None` for floating editors).
     window: Option<hostwin::HostWindow>,
+    /// The plugin's `clap.timer-support` and `clap.posix-fd-support` (null when absent).
+    timer_ext: *const clap_plugin_timer_support,
+    fd_ext: *const clap_plugin_posix_fd_support,
 }
 
 /// The link between an instance and its editor and state handles. The instance may process on
@@ -776,6 +1058,8 @@ impl Default for GuiLink {
                 created: false,
                 visible: false,
                 window: None,
+                timer_ext: std::ptr::null(),
+                fd_ext: std::ptr::null(),
             }),
             host: Arc::new(HostState::default()),
         }
@@ -825,13 +1109,20 @@ impl GuiLink {
         }
         let api = window_api().ok_or_else(|| "plugin editors are not supported on this platform".to_string())?;
         let (Some(supported), Some(create)) = (vt.is_api_supported, vt.create) else { return Err("incomplete clap.gui extension".into()) };
+        // On X11 an embedded editor lives in our window: transient for the app, closing it only
+        // hides it, and its focus is ours to give. A plugin-owned floating window has none of
+        // that, so it is the fallback there.
         // SAFETY: live plugin; `api` is a static NUL-terminated string; main thread.
+        if cfg!(target_os = "linux") && hostwin::SUPPORTED && unsafe { supported(g.plugin, api.as_ptr(), false) } {
+            return self.open_embedded(&mut g, vt, api, title);
+        }
+        // SAFETY: as above.
         if !unsafe { supported(g.plugin, api.as_ptr(), true) } {
             // SAFETY: as above.
             if hostwin::SUPPORTED && unsafe { supported(g.plugin, api.as_ptr(), false) } {
                 return self.open_embedded(&mut g, vt, api, title);
             }
-            return Err("this plugin offers only an embedded editor, which SoundCraft hosts on Windows only".into());
+            return Err("this plugin offers only an embedded editor, which SoundCraft hosts on Windows and Linux (X11) only".into());
         }
         self.host.gui_closed.store(false, Ordering::Relaxed);
         self.host.gui_destroyed.store(false, Ordering::Relaxed);
@@ -893,7 +1184,7 @@ impl GuiLink {
                 return Err(e);
             }
         };
-        let parent = clap_window { api: api.as_ptr(), specific: clap_window_handle { win32: win.parent() } };
+        let parent = clap_window { api: api.as_ptr(), specific: win.handle() };
         // SAFETY: live plugin with a created embedded GUI; `parent` names our live window and
         // outlives the call.
         if !unsafe { set_parent(g.plugin, &parent) } {
@@ -979,6 +1270,12 @@ impl GuiLink {
                 unsafe { f(g.plugin) };
             }
         }
+        GuiLink::pump_run_loop(&g, &self.host);
+        if let Some(win) = &g.window {
+            // X11: drain the host window's events (a window-manager close hides it). Windows
+            // dispatches through the app's own message loop: a no-op there.
+            win.poll_events();
+        }
         if g.created {
             let resize = self.host.gui_resize.swap(0, Ordering::Relaxed);
             if resize != 0
@@ -1021,6 +1318,39 @@ impl GuiLink {
         out
     }
 
+    /// Fires the plugin's due `clap.timer-support` timers and reports its ready
+    /// `clap.posix-fd-support` descriptors (zero-timeout `poll`). Main thread, `g.alive`. The
+    /// registries are only locked to read them: a callback may (un)register timers and fds, and
+    /// each one is re-checked right before its call so a just-removed one is never reported.
+    fn pump_run_loop(g: &GuiInner, host: &HostState) {
+        if !g.alive {
+            return;
+        }
+        // SAFETY: null or the plugin's static extension vtable, valid while `alive`.
+        if let Some(on_timer) = unsafe { g.timer_ext.as_ref() }.and_then(|t| t.on_timer) {
+            let due = host.timers.lock().unwrap_or_else(PoisonError::into_inner).due(Instant::now());
+            for id in due {
+                let live = host.timers.lock().unwrap_or_else(PoisonError::into_inner).contains(id);
+                if live {
+                    // SAFETY: live plugin, main thread, a timer it registered and still holds.
+                    unsafe { on_timer(g.plugin, id) };
+                }
+            }
+        }
+        // SAFETY: as above.
+        if let Some(on_fd) = unsafe { g.fd_ext.as_ref() }.and_then(|f| f.on_fd) {
+            let fds = host.fds.lock().unwrap_or_else(PoisonError::into_inner).snapshot();
+            for (fd, flags) in poll_fds(&fds) {
+                let wanted = host.fds.lock().unwrap_or_else(PoisonError::into_inner).flags(fd);
+                let flags = flags & wanted.unwrap_or(0);
+                if flags != 0 {
+                    // SAFETY: live plugin, main thread, an fd it registered and still holds.
+                    unsafe { on_fd(g.plugin, fd, flags) };
+                }
+            }
+        }
+    }
+
     /// Called by the instance before it destroys the plugin.
     fn kill(&self) {
         let mut g = self.lock();
@@ -1035,6 +1365,9 @@ impl GuiLink {
             }
         }
         g.alive = false;
+        drop(g);
+        self.host.timers.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.host.fds.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
 }
 
@@ -1560,6 +1893,14 @@ mod hostwin {
             self.live().unwrap_or(std::ptr::null_mut())
         }
 
+        /// The parent as `clap_window.win32`.
+        pub fn handle(&self) -> super::clap_window_handle {
+            super::clap_window_handle { win32: self.parent() }
+        }
+
+        /// Messages reach `wndproc` through the app's own message loop: nothing to drain.
+        pub fn poll_events(&self) {}
+
         pub fn raise(&self) {
             if let Some(h) = self.live() {
                 // SAFETY: a live window of this thread.
@@ -1597,8 +1938,575 @@ mod hostwin {
     }
 }
 
+/// The Linux host window for embedded editors: an X11 top-level window (through XWayland under
+/// Wayland) whose window id is the plugin's `clap_window.x11` parent. It is transient for the app
+/// window (ICCCM `WM_TRANSIENT_FOR`), so window managers keep it above SoundCraft. The window
+/// manager's close button (`WM_DELETE_WINDOW`) only unmaps it: the editor link drains this
+/// window's events in `idle`, notices, destroys the plugin's GUI and then the window, while the
+/// plugin instance keeps processing.
+///
+/// Each window has its own Xlib connection, used only under the editor link's lock. libX11 is
+/// linked the way `soundcraft-vst3-host` links it (`#[link(name = "X11")]`); the declarations
+/// below are the documented Xlib C API (Xlib manual, ICCCM, EWMH).
+#[cfg(target_os = "linux")]
+mod hostwin {
+    use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    pub const SUPPORTED: bool = true;
+
+    /// Xlib's opaque connection.
+    #[repr(C)]
+    pub struct Display {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    struct XClassHint {
+        res_name: *mut c_char,
+        res_class: *mut c_char,
+    }
+
+    /// `XSizeHints` (the two aspect `struct { int x, y; }` members flattened: same layout).
+    #[repr(C)]
+    #[derive(Default)]
+    struct XSizeHints {
+        flags: c_long,
+        x: c_int,
+        y: c_int,
+        width: c_int,
+        height: c_int,
+        min_width: c_int,
+        min_height: c_int,
+        max_width: c_int,
+        max_height: c_int,
+        width_inc: c_int,
+        height_inc: c_int,
+        min_aspect_x: c_int,
+        min_aspect_y: c_int,
+        max_aspect_x: c_int,
+        max_aspect_y: c_int,
+        base_width: c_int,
+        base_height: c_int,
+        win_gravity: c_int,
+    }
+
+    /// Room for any `XEvent` (a union of 24 longs); members are read through the structs below.
+    #[repr(C, align(8))]
+    struct XEventBuf([u8; 256]);
+
+    #[repr(C)]
+    struct XAnyEvent {
+        type_: c_int,
+        serial: c_ulong,
+        send_event: c_int,
+        display: *mut Display,
+        window: c_ulong,
+    }
+
+    #[repr(C)]
+    struct XClientMessageEvent {
+        type_: c_int,
+        serial: c_ulong,
+        send_event: c_int,
+        display: *mut Display,
+        window: c_ulong,
+        message_type: c_ulong,
+        format: c_int,
+        data: [c_long; 5],
+    }
+
+    type XErrorHandler = Option<unsafe extern "C" fn(*mut Display, *mut c_void) -> c_int>;
+
+    const DESTROY_NOTIFY: c_int = 17;
+    const CLIENT_MESSAGE: c_int = 33;
+    const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
+    const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
+    const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
+    const P_SIZE: c_long = 1 << 3;
+    const P_MIN_SIZE: c_long = 1 << 4;
+    const P_MAX_SIZE: c_long = 1 << 5;
+    const PROP_MODE_REPLACE: c_int = 0;
+    const XA_ATOM: c_ulong = 4;
+    const XA_CARDINAL: c_ulong = 6;
+    const XA_WINDOW: c_ulong = 33;
+    const REVERT_TO_PARENT: c_int = 2;
+    const CURRENT_TIME: c_ulong = 0;
+    /// Most top-level windows inspected when looking for the app window.
+    const MAX_CLIENTS: usize = 4096;
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XOpenDisplay(name: *const c_char) -> *mut Display;
+        fn XCloseDisplay(display: *mut Display) -> c_int;
+        fn XDefaultRootWindow(display: *mut Display) -> c_ulong;
+        fn XCreateSimpleWindow(
+            display: *mut Display,
+            parent: c_ulong,
+            x: c_int,
+            y: c_int,
+            width: c_uint,
+            height: c_uint,
+            border_width: c_uint,
+            border: c_ulong,
+            background: c_ulong,
+        ) -> c_ulong;
+        fn XStoreName(display: *mut Display, window: c_ulong, name: *const c_char) -> c_int;
+        fn XInternAtom(display: *mut Display, name: *const c_char, only_if_exists: c_int) -> c_ulong;
+        fn XSetWMProtocols(display: *mut Display, window: c_ulong, protocols: *mut c_ulong, count: c_int) -> c_int;
+        fn XSetClassHint(display: *mut Display, window: c_ulong, hint: *mut XClassHint) -> c_int;
+        fn XGetClassHint(display: *mut Display, window: c_ulong, hint: *mut XClassHint) -> c_int;
+        fn XSetWMNormalHints(display: *mut Display, window: c_ulong, hints: *mut XSizeHints);
+        fn XSetTransientForHint(display: *mut Display, window: c_ulong, owner: c_ulong) -> c_int;
+        fn XSelectInput(display: *mut Display, window: c_ulong, mask: c_long) -> c_int;
+        fn XMapRaised(display: *mut Display, window: c_ulong) -> c_int;
+        fn XUnmapWindow(display: *mut Display, window: c_ulong) -> c_int;
+        fn XDestroyWindow(display: *mut Display, window: c_ulong) -> c_int;
+        fn XResizeWindow(display: *mut Display, window: c_ulong, width: c_uint, height: c_uint) -> c_int;
+        fn XSetInputFocus(display: *mut Display, window: c_ulong, revert_to: c_int, time: c_ulong) -> c_int;
+        fn XChangeProperty(
+            display: *mut Display,
+            window: c_ulong,
+            property: c_ulong,
+            type_: c_ulong,
+            format: c_int,
+            mode: c_int,
+            data: *const c_uchar,
+            nelements: c_int,
+        ) -> c_int;
+        fn XGetWindowProperty(
+            display: *mut Display,
+            window: c_ulong,
+            property: c_ulong,
+            long_offset: c_long,
+            long_length: c_long,
+            delete: c_int,
+            req_type: c_ulong,
+            actual_type: *mut c_ulong,
+            actual_format: *mut c_int,
+            nitems: *mut c_ulong,
+            bytes_after: *mut c_ulong,
+            prop: *mut *mut c_uchar,
+        ) -> c_int;
+        fn XQueryTree(
+            display: *mut Display,
+            window: c_ulong,
+            root: *mut c_ulong,
+            parent: *mut c_ulong,
+            children: *mut *mut c_ulong,
+            count: *mut c_uint,
+        ) -> c_int;
+        fn XSendEvent(display: *mut Display, window: c_ulong, propagate: c_int, mask: c_long, event: *mut XEventBuf) -> c_int;
+        fn XPending(display: *mut Display) -> c_int;
+        fn XNextEvent(display: *mut Display, event: *mut XEventBuf) -> c_int;
+        fn XFlush(display: *mut Display) -> c_int;
+        fn XFree(data: *mut c_void) -> c_int;
+        fn XSetErrorHandler(handler: XErrorHandler) -> XErrorHandler;
+    }
+
+    // ---- X errors ------------------------------------------------------------------------------
+
+    /// Our connections (one per editor window), whose errors are ignored.
+    fn ours() -> &'static Mutex<Vec<usize>> {
+        static OURS: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
+        OURS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// The error handler installed before ours (Xlib's default exits the process).
+    static PREVIOUS: OnceLock<XErrorHandler> = OnceLock::new();
+
+    /// Xlib calls one process-wide handler for errors on every connection. Errors on our editor
+    /// connections (e.g. `BadWindow` when a window manager or plugin destroys a window under us)
+    /// must never end the process: they are ignored. Errors on anyone else's connection (the
+    /// app's, a plugin's) go to the handler that was there before, exactly as without us.
+    unsafe extern "C" fn on_x_error(display: *mut Display, event: *mut c_void) -> c_int {
+        let mine = ours().lock().map(|v| v.contains(&(display as usize))).unwrap_or(true);
+        if !mine && let Some(Some(previous)) = PREVIOUS.get() {
+            // SAFETY: the handler Xlib had before ours, called with the arguments Xlib gave us.
+            return unsafe { previous(display, event) };
+        }
+        0
+    }
+
+    fn install_error_handler() {
+        PREVIOUS.get_or_init(|| {
+            // SAFETY: `on_x_error` has Xlib's `XErrorHandler` signature and never unwinds.
+            unsafe { XSetErrorHandler(Some(on_x_error)) }
+        });
+    }
+
+    // ---- windows -------------------------------------------------------------------------------
+
+    fn cstring(s: &str) -> CString {
+        CString::new(s.replace('\0', "")).unwrap_or_default()
+    }
+
+    /// A window dimension from a (possibly hostile) size.
+    fn dim(v: f64) -> c_uint {
+        if v.is_finite() { v.clamp(32.0, 16_384.0) as c_uint } else { 640 }
+    }
+
+    /// The plugin's parent window and the connection that owns it.
+    struct WindowInner {
+        display: *mut Display,
+        window: c_ulong,
+        protocols_atom: c_ulong,
+        delete_atom: c_ulong,
+        /// The window manager closed (or destroyed) the window.
+        closed: AtomicBool,
+    }
+
+    impl WindowInner {
+        fn atom(&self, name: &CStr) -> c_ulong {
+            // SAFETY: live connection; `name` is NUL-terminated.
+            unsafe { XInternAtom(self.display, name.as_ptr(), 0) }
+        }
+
+        /// Pins the window to the editor's size (ICCCM `WM_NORMAL_HINTS`): the plugin sizes its
+        /// view itself and asks us through `request_resize`, so the user may not stretch it.
+        fn set_fixed_size(&self, w: c_uint, h: c_uint) {
+            let (w, h) = (w as c_int, h as c_int);
+            let mut hints = XSizeHints {
+                flags: P_SIZE | P_MIN_SIZE | P_MAX_SIZE,
+                width: w,
+                height: h,
+                min_width: w,
+                min_height: h,
+                max_width: w,
+                max_height: h,
+                ..XSizeHints::default()
+            };
+            // SAFETY: live connection and window; `hints` is a valid struct for the call.
+            unsafe { XSetWMNormalHints(self.display, self.window, &mut hints) };
+        }
+
+        /// Sets a format-32 property of `count` longs (`data` is that array).
+        fn set_longs(&self, property: c_ulong, type_: c_ulong, data: &[c_ulong]) {
+            let Ok(n) = c_int::try_from(data.len()) else { return };
+            if property != 0 {
+                // SAFETY: live connection and window; format-32 data is passed as C longs.
+                unsafe { XChangeProperty(self.display, self.window, property, type_, 32, PROP_MODE_REPLACE, data.as_ptr().cast(), n) };
+            }
+        }
+
+        fn set_title(&self, title: &str) {
+            let t = cstring(title);
+            // SAFETY: live connection and window; `t` outlives the call.
+            unsafe { XStoreName(self.display, self.window, t.as_ptr()) };
+            // EWMH `_NET_WM_NAME` carries the UTF-8 title (WM_NAME is Latin-1).
+            let (name, utf8) = (self.atom(c"_NET_WM_NAME"), self.atom(c"UTF8_STRING"));
+            let bytes = t.as_bytes();
+            if let Ok(n) = c_int::try_from(bytes.len())
+                && name != 0
+                && utf8 != 0
+            {
+                // SAFETY: as above; format-8 data of `n` bytes.
+                unsafe { XChangeProperty(self.display, self.window, name, utf8, 8, PROP_MODE_REPLACE, bytes.as_ptr(), n) };
+            }
+        }
+
+        /// Asks the window manager to activate (focus and raise) the window (EWMH
+        /// `_NET_ACTIVE_WINDOW`; focus is the WM's to give, so a refusal is fine).
+        fn request_activation(&self) {
+            let active = self.atom(c"_NET_ACTIVE_WINDOW");
+            if active == 0 {
+                return;
+            }
+            let mut buf = XEventBuf([0u8; 256]);
+            // SAFETY: `buf` is 8-aligned and larger than an `XClientMessageEvent`.
+            let cm = unsafe { &mut *(&mut buf as *mut XEventBuf).cast::<XClientMessageEvent>() };
+            cm.type_ = CLIENT_MESSAGE;
+            cm.send_event = 1;
+            cm.display = self.display;
+            cm.window = self.window;
+            cm.message_type = active;
+            cm.format = 32;
+            // Source indication 1 = a normal application; timestamp unknown.
+            cm.data = [1, 0, 0, 0, 0];
+            // SAFETY: live connection; the root window takes EWMH requests with these masks.
+            unsafe {
+                let root = XDefaultRootWindow(self.display);
+                XSendEvent(self.display, root, 0, SUBSTRUCTURE_REDIRECT_MASK | SUBSTRUCTURE_NOTIFY_MASK, &mut buf);
+            }
+        }
+    }
+
+    /// An X11 window hosting a plugin's embedded editor.
+    pub struct HostWindow {
+        inner: Box<WindowInner>,
+    }
+
+    // SAFETY: the Xlib connection belongs to this window alone and is only used by whoever holds
+    // the editor link's lock (one thread at a time); the struct merely carries it between threads.
+    unsafe impl Send for HostWindow {}
+
+    impl HostWindow {
+        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+            install_error_handler();
+            // SAFETY: null asks Xlib for the display named by $DISPLAY.
+            let display = unsafe { XOpenDisplay(std::ptr::null()) };
+            if display.is_null() {
+                return Err("cannot open the X11 display (is DISPLAY set? Wayland needs XWayland)".into());
+            }
+            ours().lock().unwrap_or_else(PoisonError::into_inner).push(display as usize);
+            let (width, height) = (dim(w), dim(h));
+            // SAFETY: a live connection and its root window.
+            let window = unsafe { XCreateSimpleWindow(display, XDefaultRootWindow(display), 0, 0, width, height, 0, 0, 0) };
+            let inner = Box::new(WindowInner { display, window, protocols_atom: 0, delete_atom: 0, closed: AtomicBool::new(false) });
+            if window == 0 {
+                HostWindow { inner }.close();
+                return Err("cannot create the editor window".into());
+            }
+            let mut inner = inner;
+            inner.protocols_atom = inner.atom(c"WM_PROTOCOLS");
+            inner.delete_atom = inner.atom(c"WM_DELETE_WINDOW");
+            inner.set_title(title);
+            let (name, class) = (cstring(EDITOR_NAME), cstring("SoundCraft"));
+            let mut hint = XClassHint { res_name: name.as_ptr().cast_mut(), res_class: class.as_ptr().cast_mut() };
+            let mut protocols = [inner.delete_atom];
+            // SAFETY: live connection and window; every pointer argument outlives its call (Xlib
+            // copies the class strings and the protocol list).
+            unsafe {
+                XSetClassHint(display, window, &mut hint);
+                // The close button sends us `WM_DELETE_WINDOW` instead of killing the connection.
+                XSetWMProtocols(display, window, protocols.as_mut_ptr(), 1);
+                XSelectInput(display, window, STRUCTURE_NOTIFY_MASK);
+            }
+            inner.set_fixed_size(width, height);
+            inner.set_longs(inner.atom(c"_NET_WM_PID"), XA_CARDINAL, &[c_ulong::from(std::process::id())]);
+            if let Some(owner) = find_app_window(display) {
+                if owner != window {
+                    // SAFETY: as above; `owner` is a window id read from the server.
+                    unsafe { XSetTransientForHint(display, window, owner) };
+                }
+            }
+            // `_NET_WM_STATE_ABOVE`, set before mapping as EWMH asks, also keeps the editor over
+            // other applications (the same choice as the VST3 host; see docs/audit-report.md §2.1).
+            let above = inner.atom(c"_NET_WM_STATE_ABOVE");
+            if above != 0 {
+                inner.set_longs(inner.atom(c"_NET_WM_STATE"), XA_ATOM, &[above]);
+            }
+            // SAFETY: as above.
+            unsafe {
+                XMapRaised(display, window);
+                XFlush(display);
+            }
+            inner.request_activation();
+            // SAFETY: as above.
+            unsafe { XFlush(display) };
+            Ok(HostWindow { inner })
+        }
+
+        /// The pointer [`resize`] works through (the boxed [`WindowInner`], stable while `self` lives).
+        pub fn raw(&self) -> *mut c_void {
+            (&*self.inner as *const WindowInner).cast_mut().cast()
+        }
+
+        /// The X11 window id the plugin embeds its editor in (`clap_window.x11`).
+        pub fn parent(&self) -> c_ulong {
+            self.inner.window
+        }
+
+        /// The parent as `clap_window.x11`.
+        pub fn handle(&self) -> super::clap_window_handle {
+            super::clap_window_handle { x11: self.parent() }
+        }
+
+        pub fn raise(&self) {
+            if self.inner.closed.load(Ordering::Relaxed) {
+                return;
+            }
+            // SAFETY: live connection and window. A focus refusal (the window not yet viewable)
+            // is an X error our handler ignores.
+            unsafe {
+                XMapRaised(self.inner.display, self.inner.window);
+                XSetInputFocus(self.inner.display, self.inner.window, REVERT_TO_PARENT, CURRENT_TIME);
+            }
+            self.inner.request_activation();
+            // SAFETY: as above.
+            unsafe { XFlush(self.inner.display) };
+        }
+
+        /// Drains this window's pending events: a window-manager close (`WM_DELETE_WINDOW`) unmaps
+        /// it and marks it closed, which the editor link turns into a teardown of the GUI.
+        pub fn poll_events(&self) {
+            if self.inner.closed.load(Ordering::Relaxed) {
+                return;
+            }
+            let d = self.inner.display;
+            // Bounded: a flood of events is finished on the next frame.
+            for _ in 0..1024 {
+                // SAFETY: live connection.
+                if unsafe { XPending(d) } <= 0 {
+                    break;
+                }
+                let mut ev = XEventBuf([0u8; 256]);
+                // SAFETY: live connection; `ev` has room for any event.
+                unsafe { XNextEvent(d, &mut ev) };
+                // SAFETY: every event starts with the `XAnyEvent` members; `ev` is 8-aligned.
+                let kind = unsafe { (*(&ev as *const XEventBuf).cast::<XAnyEvent>()).type_ };
+                match kind {
+                    CLIENT_MESSAGE => {
+                        // SAFETY: a `ClientMessage` event has the `XClientMessageEvent` layout.
+                        let cm = unsafe { &*(&ev as *const XEventBuf).cast::<XClientMessageEvent>() };
+                        if cm.message_type == self.inner.protocols_atom && cm.data[0] as c_ulong == self.inner.delete_atom {
+                            self.inner.closed.store(true, Ordering::Relaxed);
+                            // SAFETY: live connection and window.
+                            unsafe { XUnmapWindow(d, self.inner.window) };
+                        }
+                    }
+                    DESTROY_NOTIFY => self.inner.closed.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+            // SAFETY: live connection.
+            unsafe { XFlush(d) };
+        }
+
+        pub fn is_visible(&self) -> bool {
+            !self.inner.closed.load(Ordering::Relaxed)
+        }
+
+        pub fn close(self) {
+            let d = self.inner.display;
+            // SAFETY: our own window and connection, released exactly once (`self` is consumed);
+            // the plugin's GUI was destroyed first.
+            unsafe {
+                if self.inner.window != 0 {
+                    XDestroyWindow(d, self.inner.window);
+                }
+                XCloseDisplay(d);
+            }
+            ours().lock().unwrap_or_else(PoisonError::into_inner).retain(|&p| p != d as usize);
+        }
+
+        /// What a window manager sends when the user clicks the close button (tests only).
+        #[cfg(test)]
+        pub fn send_wm_close(&self) {
+            let mut buf = XEventBuf([0u8; 256]);
+            // SAFETY: `buf` is 8-aligned and larger than an `XClientMessageEvent`.
+            let cm = unsafe { &mut *(&mut buf as *mut XEventBuf).cast::<XClientMessageEvent>() };
+            cm.type_ = CLIENT_MESSAGE;
+            cm.send_event = 1;
+            cm.display = self.inner.display;
+            cm.window = self.inner.window;
+            cm.message_type = self.inner.protocols_atom;
+            cm.format = 32;
+            cm.data = [self.inner.delete_atom as c_long, 0, 0, 0, 0];
+            // SAFETY: live connection and window; mask 0 delivers to the window's creator (us).
+            unsafe {
+                XSendEvent(self.inner.display, self.inner.window, 0, 0, &mut buf);
+                XFlush(self.inner.display);
+            }
+        }
+    }
+
+    /// Resizes a host window (`window` from [`HostWindow::raw`]) and its fixed-size hints.
+    pub fn resize(window: *mut c_void, w: f64, h: f64) {
+        // SAFETY: null or the `WindowInner` of a live `HostWindow` (callers pass `raw()` of a
+        // window they hold).
+        let Some(inner) = (unsafe { window.cast_const().cast::<WindowInner>().as_ref() }) else { return };
+        if inner.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let (width, height) = (dim(w), dim(h));
+        inner.set_fixed_size(width, height);
+        // SAFETY: live connection and window.
+        unsafe {
+            XResizeWindow(inner.display, inner.window, width, height);
+            XFlush(inner.display);
+        }
+    }
+
+    /// A format-32 property as C longs (empty when absent or unreadable).
+    fn get_longs(display: *mut Display, window: c_ulong, property: c_ulong, req_type: c_ulong) -> Vec<c_ulong> {
+        if property == 0 {
+            return Vec::new();
+        }
+        let (mut actual_type, mut format, mut n, mut after) = (0 as c_ulong, 0 as c_int, 0 as c_ulong, 0 as c_ulong);
+        let mut data: *mut c_uchar = std::ptr::null_mut();
+        // SAFETY: live connection; every out-pointer is a valid local; Xlib allocates `data`.
+        let status = unsafe {
+            XGetWindowProperty(display, window, property, 0, MAX_CLIENTS as c_long, 0, req_type, &mut actual_type, &mut format, &mut n, &mut after, &mut data)
+        };
+        if status != 0 || data.is_null() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if format == 32 && actual_type == req_type {
+            let count = usize::try_from(n).unwrap_or(0).min(MAX_CLIENTS);
+            // SAFETY: format-32 property data is an array of `n` C longs (Xlib manual); we read at
+            // most `n` of them.
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(data.cast::<c_ulong>(), count) });
+        }
+        // SAFETY: `data` was allocated by Xlib for this call.
+        unsafe { XFree(data.cast()) };
+        out
+    }
+
+    /// The root window's direct children (fallback without an EWMH client list).
+    fn root_children(display: *mut Display, root: c_ulong) -> Vec<c_ulong> {
+        let (mut r, mut p) = (0 as c_ulong, 0 as c_ulong);
+        let mut children: *mut c_ulong = std::ptr::null_mut();
+        let mut count: c_uint = 0;
+        // SAFETY: live connection; out-pointers are valid locals; Xlib allocates `children`.
+        if unsafe { XQueryTree(display, root, &mut r, &mut p, &mut children, &mut count) } == 0 || children.is_null() {
+            return Vec::new();
+        }
+        let n = usize::try_from(count).unwrap_or(0).min(MAX_CLIENTS);
+        // SAFETY: `children` holds `count` window ids; we read at most that many.
+        let out = unsafe { std::slice::from_raw_parts(children, n) }.to_vec();
+        // SAFETY: allocated by Xlib for this call.
+        unsafe { XFree(children.cast()) };
+        out
+    }
+
+    /// `WM_CLASS` instance name of our (and the VST3 host's) editor windows.
+    const EDITOR_NAME: &str = "soundcraft-plugin";
+
+    /// Whether a window's `WM_CLASS` names the SoundCraft app (not one of its editor windows).
+    fn is_soundcraft(display: *mut Display, window: c_ulong) -> bool {
+        let mut hint = XClassHint { res_name: std::ptr::null_mut(), res_class: std::ptr::null_mut() };
+        // SAFETY: live connection; `hint` is a valid out-struct; a vanished window is an ignored
+        // X error and a zero status.
+        if unsafe { XGetClassHint(display, window, &mut hint) } == 0 {
+            return false;
+        }
+        let mut parts = [String::new(), String::new()];
+        for (s, out) in [hint.res_name, hint.res_class].into_iter().zip(parts.iter_mut()) {
+            if !s.is_null() {
+                // SAFETY: Xlib returns NUL-terminated strings, freed right after.
+                *out = unsafe { CStr::from_ptr(s) }.to_string_lossy().to_ascii_lowercase();
+                // SAFETY: allocated by Xlib for `XGetClassHint`.
+                unsafe { XFree(s.cast()) };
+            }
+        }
+        let [name, class] = parts;
+        name != EDITOR_NAME && (class.contains("soundcraft") || name.contains("soundcraft"))
+    }
+
+    /// The application's own top-level window (`WM_CLASS` containing "soundcraft", preferring
+    /// this process's `_NET_WM_PID`), the transient owner of editor windows. Looked up in the
+    /// EWMH `_NET_CLIENT_LIST` (client windows, not window-manager frames), else the root's children.
+    fn find_app_window(display: *mut Display) -> Option<c_ulong> {
+        // SAFETY: live connection.
+        let root = unsafe { XDefaultRootWindow(display) };
+        // SAFETY: as above; the name is NUL-terminated.
+        let atom = |name: &CStr| unsafe { XInternAtom(display, name.as_ptr(), 0) };
+        let mut candidates = get_longs(display, root, atom(c"_NET_CLIENT_LIST"), XA_WINDOW);
+        if candidates.is_empty() {
+            candidates = root_children(display, root);
+        }
+        let apps: Vec<c_ulong> = candidates.into_iter().filter(|&w| w != 0 && is_soundcraft(display, w)).collect();
+        let pid_atom = atom(c"_NET_WM_PID");
+        let pid = c_ulong::from(std::process::id());
+        apps.iter().copied().find(|&w| get_longs(display, w, pid_atom, XA_CARDINAL).first() == Some(&pid)).or_else(|| apps.first().copied())
+    }
+}
+
 /// Other platforms: embedded editors are not hosted (floating ones still are).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod hostwin {
     use std::ffi::c_void;
 
@@ -1616,7 +2524,11 @@ mod hostwin {
         pub fn parent(&self) -> *mut c_void {
             std::ptr::null_mut()
         }
+        pub fn handle(&self) -> super::clap_window_handle {
+            super::clap_window_handle { ptr: std::ptr::null_mut() }
+        }
         pub fn raise(&self) {}
+        pub fn poll_events(&self) {}
         pub fn is_visible(&self) -> bool {
             false
         }
@@ -1653,5 +2565,175 @@ mod tests {
         assert_eq!((e.tempo, e.bar_number, e.tsig_num, e.tsig_denom), (90.0, 1, 3, 4));
         let nan = transport_event(&Transport { quarters: f64::NAN, ..t });
         assert_eq!(nan.song_pos_beats, 0);
+    }
+
+    #[test]
+    fn timers_register_cap_unregister_and_fall_due() {
+        let t0 = Instant::now();
+        let mut r = TimerRegistry::default();
+        let a = r.register(10, t0).expect("first timer");
+        let b = r.register(0, t0).expect("a zero period is raised to 1 ms");
+        assert_ne!(a, b);
+        assert!(r.contains(a) && r.contains(b));
+        assert!(r.due(t0).is_empty(), "nothing is due before one period");
+        assert_eq!(r.due(t0 + Duration::from_millis(1)), vec![b]);
+        let mut due = r.due(t0 + Duration::from_millis(10));
+        due.sort_unstable();
+        let mut both = vec![a, b];
+        both.sort_unstable();
+        assert_eq!(due, both, "each due timer fires once per pump");
+        // Missed ticks are not replayed: one call after a long stall fires each timer once.
+        assert_eq!(r.due(t0 + Duration::from_secs(60)).len(), 2);
+        assert!(r.due(t0 + Duration::from_secs(60)).is_empty(), "rescheduled one period later");
+        assert!(r.unregister(a));
+        assert!(!r.unregister(a), "already gone");
+        assert!(!r.contains(a));
+        assert!(r.due(t0 + Duration::from_secs(120)) == vec![b]);
+        // The cap holds, and ids never collide or use CLAP_INVALID_ID, also across wrap-around.
+        let mut r = TimerRegistry { next_id: CLAP_INVALID_ID - 2, ..TimerRegistry::default() };
+        let ids: Vec<clap_id> = (0..MAX_TIMERS).filter_map(|_| r.register(u32::MAX, t0)).collect();
+        assert_eq!(ids.len(), MAX_TIMERS);
+        assert!(!ids.contains(&CLAP_INVALID_ID));
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), MAX_TIMERS);
+        assert_eq!(r.register(5, t0), None, "capped");
+        assert!(r.unregister(ids[3]));
+        assert!(r.register(5, t0).is_some(), "a freed slot is reusable");
+        assert!(r.due(t0 + Duration::from_secs(3600)).len() <= MAX_TIMERS, "huge periods are clamped, not overflowing");
+        r.clear();
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn fds_register_modify_cap_and_unregister() {
+        let mut r = FdRegistry::default();
+        assert!(!r.register(-1, CLAP_POSIX_FD_READ), "negative fds are refused");
+        assert!(r.register(5, CLAP_POSIX_FD_READ | 0x80), "unknown bits are dropped");
+        assert_eq!(r.flags(5), Some(CLAP_POSIX_FD_READ));
+        assert!(!r.register(5, CLAP_POSIX_FD_WRITE), "already registered");
+        assert!(r.modify(5, CLAP_POSIX_FD_WRITE | CLAP_POSIX_FD_ERROR));
+        assert_eq!(r.flags(5), Some(CLAP_POSIX_FD_WRITE | CLAP_POSIX_FD_ERROR));
+        assert!(!r.modify(6, CLAP_POSIX_FD_READ), "not registered");
+        assert!(r.unregister(5));
+        assert!(!r.unregister(5));
+        assert_eq!(r.flags(5), None);
+        for fd in 0..MAX_FDS as i32 {
+            assert!(r.register(fd, CLAP_POSIX_FD_READ));
+        }
+        assert!(!r.register(10_000, CLAP_POSIX_FD_READ), "capped");
+        assert_eq!(r.snapshot().len(), MAX_FDS);
+        r.clear();
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn poll_results_map_to_the_registered_clap_flags() {
+        use pollbits::*;
+        let rw = CLAP_POSIX_FD_READ | CLAP_POSIX_FD_WRITE;
+        assert_eq!(events_for(rw), POLLIN | POLLPRI | POLLOUT);
+        assert_eq!(events_for(CLAP_POSIX_FD_ERROR), 0, "errors are always reported by poll");
+        assert_eq!(ready_flags(rw, POLLIN), CLAP_POSIX_FD_READ);
+        assert_eq!(ready_flags(rw, POLLHUP), CLAP_POSIX_FD_READ, "hang-up reads as end of stream");
+        assert_eq!(ready_flags(CLAP_POSIX_FD_READ, POLLOUT), 0, "write readiness nobody asked for");
+        assert_eq!(ready_flags(FD_FLAGS, POLLERR | POLLOUT), CLAP_POSIX_FD_WRITE | CLAP_POSIX_FD_ERROR);
+        assert_eq!(ready_flags(rw, POLLNVAL), 0);
+    }
+
+    /// A real pipe through the zero-timeout `poll`: readable only once written to.
+    #[cfg(unix)]
+    #[test]
+    fn registered_fds_are_polled_without_blocking() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let (rx, mut tx) = std::io::pipe().expect("pipe");
+        let fds = [(rx.as_raw_fd(), CLAP_POSIX_FD_READ)];
+        assert!(poll_fds(&fds).is_empty(), "nothing to read yet");
+        tx.write_all(b"x").expect("write");
+        assert_eq!(poll_fds(&fds), vec![(rx.as_raw_fd(), CLAP_POSIX_FD_READ)]);
+        assert!(poll_fds(&[]).is_empty());
+    }
+
+    /// The host extensions edit the instance's own registries through its `clap_host`.
+    #[test]
+    fn timer_and_fd_extensions_reach_the_instance_state() {
+        let state = Arc::new(HostState::default());
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: Arc::as_ptr(&state).cast_mut().cast::<c_void>(),
+            name: c"t".as_ptr(),
+            vendor: c"t".as_ptr(),
+            url: c"t".as_ptr(),
+            version: c"t".as_ptr(),
+            get_extension: Some(host_get_extension),
+            request_restart: Some(host_request_restart),
+            request_process: Some(host_request_process),
+            request_callback: Some(host_request_callback),
+        };
+        // SAFETY: test calls through our own callbacks with a valid host and valid pointers.
+        unsafe {
+            let timers = host_get_extension(&host, CLAP_EXT_TIMER_SUPPORT.as_ptr()).cast::<clap_host_timer_support>();
+            let fds = host_get_extension(&host, CLAP_EXT_POSIX_FD_SUPPORT.as_ptr()).cast::<clap_host_posix_fd_support>();
+            if !SERVES_RUN_LOOP {
+                assert!(timers.is_null() && fds.is_null());
+                return;
+            }
+            let (Some(t), Some(f)) = (timers.as_ref(), fds.as_ref()) else { panic!("extensions served") };
+            let mut id = CLAP_INVALID_ID;
+            assert!((t.register_timer.expect("register"))(&host, 16, &mut id));
+            assert_ne!(id, CLAP_INVALID_ID);
+            assert!(!(t.register_timer.expect("register"))(&host, 16, std::ptr::null_mut()), "null out-pointer");
+            // A failed registration writes CLAP_INVALID_ID to the out-pointer: use another one.
+            let mut refused = 7;
+            assert!(!(t.register_timer.expect("register"))(std::ptr::null(), 16, &mut refused), "null host");
+            assert_eq!(refused, CLAP_INVALID_ID);
+            assert_eq!(state.timers.lock().expect("lock").len(), 1);
+            assert!((t.unregister_timer.expect("unregister"))(&host, id));
+            assert!(!(t.unregister_timer.expect("unregister"))(&host, id), "already gone");
+            assert!((f.register_fd.expect("register"))(&host, 3, CLAP_POSIX_FD_READ));
+            assert!((f.modify_fd.expect("modify"))(&host, 3, CLAP_POSIX_FD_WRITE));
+            assert_eq!(state.fds.lock().expect("lock").flags(3), Some(CLAP_POSIX_FD_WRITE));
+            assert!((f.unregister_fd.expect("unregister"))(&host, 3));
+            assert!(!(f.unregister_fd.expect("unregister"))(&host, 3));
+        }
+    }
+
+    /// The Linux editor window is a real X11 window: it opens, resizes, turns a window-manager
+    /// close into "hidden", and closes. Skipped without a usable display (headless CI), where
+    /// opening must fail cleanly instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x11_editor_window_opens_resizes_and_closes() {
+        if std::env::var_os("DISPLAY").is_none() {
+            assert!(hostwin::HostWindow::new("no display", 320.0, 200.0).is_err(), "without DISPLAY opening reports an error");
+            return;
+        }
+        let Ok(win) = hostwin::HostWindow::new("SoundCraft editor test", 320.0, 200.0) else {
+            // No usable X server from this process (permissions, remote CI): nothing to assert.
+            return;
+        };
+        assert_ne!(win.parent(), 0, "the window id handed to the plugin is set");
+        // SAFETY: reading the union member `handle` wrote.
+        assert_eq!(unsafe { win.handle().x11 }, win.parent());
+        assert!(win.is_visible());
+        hostwin::resize(win.raw(), 400.0, 300.0);
+        hostwin::resize(win.raw(), f64::NAN, f64::INFINITY);
+        hostwin::resize(std::ptr::null_mut(), 1.0, 1.0);
+        win.raise();
+        win.poll_events();
+        assert!(win.is_visible(), "no close request yet");
+        win.send_wm_close();
+        for _ in 0..50 {
+            win.poll_events();
+            if !win.is_visible() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!win.is_visible(), "the window manager's close hides the window");
+        hostwin::resize(win.raw(), 400.0, 300.0);
+        win.raise();
+        win.close();
     }
 }

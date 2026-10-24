@@ -1,13 +1,14 @@
 # Plugin parity: built-in processors and plugin hosting
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (mix.instrument sets built-in instrument parameters in params (#265); previously minor: plugin editors on Windows) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** minor (insert and instrument commands resolve bridged plugins from the catalogue, never loading them on the UI thread; plugin validation moved off the UI thread with a visible state in the FX list) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Pro Tools users live in plugins: the bundled set covers everyday mixing, and third-party plugins
 cover the rest. This doc tracks both. Our plugins have our own names and are written from
 scratch (clean-room rule): Avid plugin names are not used here, only categories.
 
 **Built-in plugins and AudioSuite: breadth ~40 %, ready ~35 %** (80–120 h).
-**Third-party hosting: breadth ~70 %, ready ~45 %** (40–60 h). Both estimated.
+**Third-party hosting: breadth ~70 %, ready ~55 %** (40–60 h). Both estimated. Every installed
+plugin is now measured rather than assumed: see [plugin-verification.md](plugin-verification.md).
 
 ## Built-in processors (measured from `crates/dsp/src/plugins`)
 
@@ -44,20 +45,24 @@ User report #152: a saved instrument level does not reach the bounce.
 | Notes / MIDI to instruments | ✅ | ✅ | But no live MIDI input (G-02) |
 | State saved in sessions, presets | ✅ | ✅ | |
 | Create/destroy off the audio thread | ✅ | ✅ | |
-| Editors: CLAP | — | 🟡 floating windows; embedded editors on Windows | Embedded on macOS/Linux missing |
-| Editors: VST3 | — | 🟡 macOS (verified with a commercial pitch editor) and Windows (verified with a free JUCE compressor) | Linux views missing |
+| Editors: CLAP | — | 🟡 floating windows; embedded editors on Windows | Embedded on macOS missing; Linux CLAP editors still report unsupported |
+| Editors: VST3 | — | 🟡 macOS (verified with a commercial pitch editor) and Windows (verified with a free JUCE compressor); Linux: native X11 windows with `Linux::IRunLoop` fd/timer dispatch — what bridged Kontakt under yabridge needs | not exercised on Linux with a real bridged plugin in this environment |
 | Editors: AU | — | ❌ | Cocoa view hosting missing |
 | Multiple editor pages | ✅ | 🟡 | #6 |
 | macOS hardened-runtime entitlement for third-party code | ✅ | ❌ | #153, #149 — signed builds refuse third-party VST3 |
 | Sidechain / key input | ✅ | ❌ | All three hosts |
 | ARA 2 (pitch/time editors in the timeline) | ✅ | ❌ | Menu leaves Track/Clip/Window ▸ ARA still missing |
-| Crash isolation | in-process (DSP on HDX) | in-process | Out-of-process hosting would beat Pro Tools |
+| Crash isolation | in-process (DSP on HDX) | in-process, behind a validation child | Out-of-process hosting would beat Pro Tools |
+| Bridged (Wine) plugins: insert, load, report | ✅ | 🟡 | Inserting resolves the id from the scan catalogue without loading the bundle (a bridged plugin takes seconds under Wine and one that hangs froze the interface); the audio side loads a third-party plugin only after `--probe-plugin` proved it loads, now on a worker thread, and a slot that is still loading or was refused says so in the FX list |
 | Plugin delay reporting changes on the fly | ✅ | 🟡 | Aux insert latency bug #103 (PR #133) |
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-19 | minor | Every installed plugin verified end to end (48/53); bridged Windows plugins find their sibling DLLs through `WINEPATH`; Pianoteq 9 fixed. See plugin-verification.md |
+| 2026-10-18 | minor | Bridged plugin insert no longer loads the bundle on the UI thread; validation child asynchronous with state in the FX list |
 | 2026-10-13 | trivial | mix.instrument sets built-in instrument parameters in params (#265) |
+| 2026-10-18 | minor | Linux VST3 editor windows (X11 + Linux run loop), yabridge search paths, plugin scanning off the UI thread |
 | 2026-10-12 | minor | Editors: VST3 and embedded CLAP editors on Windows |
 | 2026-10-10 | major | Created: built-in processor inventory by category and third-party hosting checklist |

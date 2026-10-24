@@ -27,6 +27,13 @@ serde_json.workspace = true
 log.workspace = true
 image.workspace = true
 
+# Hardware MIDI I/O for control surfaces: the ALSA sequencer (safe API of the `alsa` crate),
+# which is the same layer USB-MIDI, BLE-MIDI bridges and PipeWire expose on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+# BLE-MIDI over BlueZ's D-Bus GATT API (BlueZ has no MIDI profile of its own).
+zbus = "5"
+
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 

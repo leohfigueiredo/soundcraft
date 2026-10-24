@@ -20,8 +20,37 @@ struct Registry {
     /// One leaked `PluginInfo` per plugin type that was actually instantiated (bounded by the
     /// number of distinct installed plugins).
     infos: HashMap<String, &'static PluginInfo>,
+    /// One leaked `PluginInfo` per catalogue entry, built from the descriptor alone: commands
+    /// that only need the id, the name and the kind must never pay for a plugin load.
+    meta: HashMap<String, &'static PluginInfo>,
     /// Ids that failed to instantiate (not retried every UI frame).
     failed: HashSet<String>,
+}
+
+fn load_disk_cache_if_needed(r: &mut Registry) {
+    if r.scanned.is_some() {
+        return;
+    }
+    let Some(path) = std::env::var_os("SOUNDCRAFT_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("soundcraft")))
+        .map(|d| d.join("plugins_cache.json"))
+    else {
+        return;
+    };
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(clap_val) = val.get("clap")
+        && let Ok(descriptors) = serde_json::from_value::<Vec<ClapDescriptor>>(clap_val.clone())
+        && !descriptors.is_empty()
+    {
+        log::info!("clap-host: loaded {} descriptors from disk cache ({})", descriptors.len(), path.display());
+        r.scanned = Some(descriptors);
+    }
+}
+
+fn scan_all() -> Vec<ClapDescriptor> {
+    scan_paths(&search_dirs())
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -69,42 +98,117 @@ pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
     out
 }
 
-fn ensure_scanned(r: &mut Registry) -> &Vec<ClapDescriptor> {
-    if r.scanned.is_none() {
-        let mut dirs = paths::default_search_paths();
-        dirs.extend(r.extra_dirs.iter().cloned());
-        r.scanned = Some(scan_paths(&dirs));
+/// Replaces the catalogue with a scan produced by another process (the `--scan-plugins` helper).
+/// No plugin code runs here: only the descriptor list is stored.
+pub fn adopt_scan(descriptors: Vec<ClapDescriptor>) {
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    let mut list: Vec<ClapDescriptor> = Vec::with_capacity(descriptors.len());
+    for d in descriptors {
+        if !list.iter().any(|o| o.id == d.id) {
+            list.push(d);
+        }
     }
-    r.scanned.get_or_insert_with(Vec::new)
-}
-
-pub fn scan() -> Vec<ClapDescriptor> {
-    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
-    ensure_scanned(&mut r).clone()
-}
-
-pub fn cached() -> Option<Vec<ClapDescriptor>> {
-    registry().lock().unwrap_or_else(PoisonError::into_inner).scanned.clone()
-}
-
-pub fn rescan() -> Vec<ClapDescriptor> {
-    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
-    r.scanned = None;
+    list.sort_by_key(|d| d.name.to_lowercase());
+    r.scanned = Some(list);
     r.failed.clear();
-    ensure_scanned(&mut r).clone()
+    r.meta.clear();
 }
 
-pub fn add_search_dir(dir: &Path) -> usize {
+/// The folders registered for scanning (the standard locations are not included).
+pub fn extra_dirs() -> Vec<PathBuf> {
+    registry().lock().unwrap_or_else(PoisonError::into_inner).extra_dirs.clone()
+}
+
+/// The folders to scan: the standard locations plus every folder the user added.
+fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs = paths::default_search_paths();
+    if let Ok(r) = registry().try_lock() {
+        dirs.extend(r.extra_dirs.iter().cloned());
+    }
+    dirs
+}
+
+/// Scans `dirs` (uncached) *outside* the registry lock, so a slow walk of a large or removable
+/// drive never blocks the UI's catalogue readers.
+pub fn scan() -> Vec<ClapDescriptor> {
+    if let Ok(r) = registry().try_lock()
+        && let Some(list) = &r.scanned
+    {
+        return list.clone();
+    }
+    let found = scan_all();
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    if r.scanned.is_none() {
+        r.scanned = Some(found.clone());
+    }
+    r.scanned.as_ref().cloned().unwrap_or(found)
+}
+
+/// The bundle a plugin id lives in, from the catalogue. Cheap: no plugin code is loaded.
+pub fn bundle_path(id: &str) -> Option<PathBuf> {
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    load_disk_cache_if_needed(&mut r);
+    if let Some(p) = r.scanned.as_ref().and_then(|list| list.iter().find(|d| d.id == id).map(|d| d.path.clone())) {
+        return Some(p);
+    }
+    let found = scan_all();
+    let p = found.iter().find(|d| d.id == id).map(|d| d.path.clone());
+    if let Some(list) = r.scanned.as_mut() {
+        for item in found {
+            if !list.iter().any(|o| o.id == item.id) {
+                list.push(item);
+            }
+        }
+    } else {
+        r.scanned = Some(found);
+    }
+    p
+}
+
+/// The cached catalogue. The lock is only ever held for fast in-memory merges (the disk walk and
+/// `dlopen` happen outside it), so this never blocks on a slow scan of a removable drive.
+pub fn cached() -> Option<Vec<ClapDescriptor>> {
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    load_disk_cache_if_needed(&mut r);
+    r.scanned.clone()
+}
+
+/// Forgets the cached catalogue and scans again, holding the lock only to store the result.
+pub fn rescan() -> Vec<ClapDescriptor> {
+    let found = scan_all();
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    r.scanned = Some(found.clone());
+    r.failed.clear();
+    r.meta.clear();
+    found
+}
+
+/// Registers a folder in the search path without scanning it. The next (background) `rescan`
+/// picks it up; registering is O(1), so it is safe to call from the UI thread.
+pub fn register_search_dir(dir: &Path) {
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     if !r.extra_dirs.iter().any(|d| d == dir) {
         r.extra_dirs.push(dir.to_path_buf());
     }
+}
+
+/// Adds a folder to the search path and merges its plugins into the cache. The scan runs
+/// without holding the lock. Call off the UI thread.
+pub fn add_search_dir(dir: &Path) -> usize {
+    {
+        let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+        if !r.extra_dirs.iter().any(|d| d == dir) {
+            r.extra_dirs.push(dir.to_path_buf());
+        }
+    }
     let found = scan_paths(&[dir.to_path_buf()]);
-    let n = found.len();
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     let list = r.scanned.get_or_insert_with(Vec::new);
+    let mut n = 0;
     for d in found {
         if !list.iter().any(|o| o.id == d.id) {
             list.push(d);
+            n += 1;
         }
     }
     n
@@ -159,16 +263,36 @@ fn build_info(d: &ClapDescriptor, inst: &Instance) -> &'static PluginInfo {
     }))
 }
 
+/// Finds a plugin's descriptor in the catalogue. Discovery is explicit because scanning loads
+/// third-party modules and must not be triggered by a render or a UI lookup.
+fn lookup_descriptor(id: &str) -> Result<ClapDescriptor, ClapError> {
+    let plugin_id = parse_id(id).ok_or_else(|| ClapError::NotFound(id.to_string()))?;
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    if r.failed.contains(id) {
+        return Err(ClapError::Instantiate(plugin_id.to_string(), "failed before".into()));
+    }
+    load_disk_cache_if_needed(&mut r);
+    if let Some(d) = r.scanned.as_ref().and_then(|s| s.iter().find(|d| d.id == id)).cloned() {
+        return Ok(d);
+    }
+    let found = scan_all();
+    let d = found.iter().find(|d| d.id == id).cloned();
+    if let Some(list) = r.scanned.as_mut() {
+        for item in found {
+            if !list.iter().any(|o| o.id == item.id) {
+                list.push(item);
+            }
+        }
+    } else {
+        r.scanned = Some(found);
+    }
+    d.ok_or_else(|| ClapError::NotFound(id.to_string()))
+}
+
 /// Finds the descriptor, loads its binary and creates an instance plus its (cached) info.
 fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), ClapError> {
     let plugin_id = parse_id(id).ok_or_else(|| ClapError::NotFound(id.to_string()))?;
-    let desc = {
-        let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
-        if r.failed.contains(id) {
-            return Err(ClapError::Instantiate(plugin_id.to_string(), "failed before".into()));
-        }
-        ensure_scanned(&mut r).iter().find(|d| d.id == id).cloned().ok_or_else(|| ClapError::NotFound(id.to_string()))?
-    };
+    let desc = lookup_descriptor(id)?;
     let made = Bundle::load(&desc.path).and_then(|b| b.instantiate(plugin_id));
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     match made {
@@ -210,4 +334,57 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
     }
     // Instantiate once to learn the parameters (CLAP exposes them only on an instance).
     instantiate_raw(id).ok().map(|(_, info)| info)
+}
+
+/// What this process already knows about a plugin, loading nothing: its parameters once an instance
+/// has been created, otherwise just the catalogue entry (empty `params`).
+///
+/// [`plugin_info`] loads the module to read its parameter list. That is seconds for a bridged plugin
+/// and a stall if the bridge is stuck, so anything that runs per UI frame must call this instead.
+pub fn cached_plugin_info(id: &str) -> Option<&'static PluginInfo> {
+    parse_id(id)?;
+    if let Ok(r) = registry().try_lock()
+        && let Some(info) = r.infos.get(id)
+    {
+        return Some(*info);
+    }
+    descriptor_info(id)
+}
+
+/// A catalogue entry as [`PluginInfo`], built from its descriptor: no module is loaded. Commands
+/// that only need the id, the name and the kind use this instead of [`plugin_info`].
+pub fn descriptor_info(id: &str) -> Option<&'static PluginInfo> {
+    parse_id(id)?;
+    let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(info) = r.meta.get(id) {
+        return Some(*info);
+    }
+    load_disk_cache_if_needed(&mut r);
+    let d = if let Some(d) = r.scanned.as_ref().and_then(|s| s.iter().find(|d| d.id == id)).cloned() {
+        d
+    } else {
+        let found = scan_all();
+        let d = found.iter().find(|d| d.id == id).cloned()?;
+        if let Some(list) = r.scanned.as_mut() {
+            for item in found {
+                if !list.iter().any(|o| o.id == item.id) {
+                    list.push(item);
+                }
+            }
+        } else {
+            r.scanned = Some(found);
+        }
+        d
+    };
+    let info: &'static PluginInfo = Box::leak(Box::new(PluginInfo {
+        id: leak(d.id.clone()),
+        name: leak(d.name.clone()),
+        short_name: leak(d.name.chars().take(8).collect()),
+        category: d.category,
+        params: &[],
+        is_instrument: d.is_instrument,
+        audiosuite: false,
+    }));
+    r.meta.insert(id.to_string(), info);
+    Some(info)
 }

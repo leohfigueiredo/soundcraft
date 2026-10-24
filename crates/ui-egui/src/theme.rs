@@ -74,16 +74,24 @@ pub enum ThemeMode {
     Light,
     #[default]
     Dark,
+    StudioPro,
+    FLStudio,
+    Cyberpunk,
+    Vintage,
 }
 
 impl ThemeMode {
-    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
+    pub const ALL: [Self; 7] = [Self::Dark, Self::FLStudio, Self::StudioPro, Self::Light, Self::Cyberpunk, Self::Vintage, Self::System];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
+            Self::Light => "Clean Light",
+            Self::Dark => "Dark Studio",
+            Self::StudioPro => "Studio Pro (Black Piano)",
+            Self::FLStudio => "FL Studio (Charcoal & Neon)",
+            Self::Cyberpunk => "Cyberpunk / Neon",
+            Self::Vintage => "Vintage Console",
         }
     }
 
@@ -93,12 +101,76 @@ impl ThemeMode {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::StudioPro => "studiopro",
+            Self::FLStudio => "flstudio",
+            Self::Cyberpunk => "cyberpunk",
+            Self::Vintage => "vintage",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|m| m.id().eq_ignore_ascii_case(s.trim()))
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("flstudio") || trimmed.eq_ignore_ascii_case("fl") || trimmed.eq_ignore_ascii_case("fruity") {
+            return Some(Self::FLStudio);
+        }
+        if trimmed.eq_ignore_ascii_case("studiopro")
+            || trimmed.eq_ignore_ascii_case("studio")
+            || trimmed.eq_ignore_ascii_case("presonus")
+            || trimmed.eq_ignore_ascii_case("piano")
+            || trimmed.eq_ignore_ascii_case("blackpiano")
+        {
+            return Some(Self::StudioPro);
+        }
+        if trimmed.eq_ignore_ascii_case("neon") {
+            return Some(Self::Cyberpunk);
+        }
+        if trimmed.eq_ignore_ascii_case("console") || trimmed.eq_ignore_ascii_case("analog") {
+            return Some(Self::Vintage);
+        }
+        Self::ALL.into_iter().find(|m| m.id().eq_ignore_ascii_case(trimmed))
     }
+}
+
+/// Meter visual presentation style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MeterStyle {
+    /// 12-segment discrete LED peak ladder matching hardware consoles and the iCON P1-M controller
+    Segmented12Led,
+    /// Smooth continuous analog gradient
+    Continuous,
+    /// Warm incandescent VU meter styling
+    VintageVu,
+    /// Future digital high-contrast neon blocks
+    CyberNeon,
+}
+
+/// Fader cap tactile & morphological style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FaderCapStyle {
+    /// Brushed aluminum tactile hardware cap with center grip ribs and drop shadow (matching iCON P1-M hardware)
+    TactileMetallic,
+    /// Piano black anodized Studio Pro cap with neon center indicator
+    StudioPro,
+    /// Fluted vintage bakelite console cap
+    VintageBakelite,
+    /// Modern clean flat cap
+    ModernFlat,
+}
+
+/// Rotary knob visual styling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KnobStyle {
+    /// Ribbed cylindrical metallic knob with reflection notch and radial LED ring
+    Hardware3D,
+    /// Studio Pro sleek dark knob with electric cyan arc
+    StudioSleek,
+    /// Vintage console pointer knob with classic analog skirt
+    VintageConsole,
+    /// Cyberpunk glowing ring
+    CyberRing,
+    /// Behringer X-Touch Compact style: a dark rotary cap inside a glowing LED ring that also
+    /// reads as a level meter (green → amber → red), like the hardware's encoder collars.
+    XTouchLed,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -210,6 +282,13 @@ pub struct Tokens {
     pub slot_face: [Color32; 2],
     pub slot_bypassed: [Color32; 2],
     pub slot_mark: Color32,
+    /// Architectural and morphological styling tokens.
+    pub meter_style: MeterStyle,
+    pub fader_cap_style: FaderCapStyle,
+    pub knob_style: KnobStyle,
+    pub corner_radius: f32,
+    pub button_radius: f32,
+    pub panel_depth: f32,
 }
 
 impl Tokens {
@@ -296,6 +375,12 @@ impl Tokens {
         slot_face: [Color32::from_rgb(92, 92, 92), Color32::from_rgb(75, 75, 75)],
         slot_bypassed: [Color32::from_rgb(66, 96, 146), Color32::from_rgb(50, 76, 120)],
         slot_mark: Color32::from_rgb(159, 159, 159),
+        meter_style: MeterStyle::Segmented12Led,
+        fader_cap_style: FaderCapStyle::TactileMetallic,
+        knob_style: KnobStyle::Hardware3D,
+        corner_radius: 2.0,
+        button_radius: 2.0,
+        panel_depth: 0.15,
     };
 
     pub const LIGHT: Tokens = Tokens {
@@ -381,25 +466,469 @@ impl Tokens {
         slot_face: [Color32::from_rgb(244, 245, 247), Color32::from_rgb(214, 216, 220)],
         slot_bypassed: [Color32::from_rgb(190, 210, 240), Color32::from_rgb(160, 186, 228)],
         slot_mark: Color32::from_rgb(92, 95, 102),
+        meter_style: MeterStyle::Continuous,
+        fader_cap_style: FaderCapStyle::ModernFlat,
+        knob_style: KnobStyle::Hardware3D,
+        corner_radius: 3.0,
+        button_radius: 2.0,
+        panel_depth: 0.05,
+    };
+
+    pub const CYBERPUNK: Tokens = Tokens {
+        window_bg: Color32::from_rgb(10, 10, 16),
+        panel_bg: Color32::from_rgb(16, 16, 26),
+        panel_bg2: Color32::from_rgb(22, 22, 36),
+        toolbar_bg: Color32::from_rgb(14, 14, 22),
+        toolbar_group: Color32::from_rgb(18, 18, 30),
+        border: Color32::from_rgb(40, 25, 60),
+        border_light: Color32::from_rgb(80, 40, 120),
+        edge_light: Color32::from_rgba_premultiplied(0, 220, 255, 30),
+        text: Color32::from_rgb(225, 240, 255),
+        text_dim: Color32::from_rgb(130, 150, 185),
+        text_dark: Color32::from_rgb(10, 10, 16),
+        header_text: Color32::from_rgb(200, 230, 255),
+        counter_bg: Color32::from_rgb(5, 5, 10),
+        counter_text: Color32::from_rgb(0, 255, 230),
+        counter_label: Color32::from_rgb(255, 0, 128),
+        accent: Color32::from_rgb(0, 220, 255),
+        accent_dark: Color32::from_rgb(0, 140, 180),
+        mode_on: Color32::from_rgb(0, 255, 180),
+        mode_on_text: Color32::from_rgb(5, 25, 15),
+        mode_off_text: Color32::from_rgb(0, 200, 150),
+        button: Color32::from_rgb(32, 28, 48),
+        button_hi: Color32::from_rgb(48, 40, 72),
+        button_border: Color32::from_rgb(60, 45, 90),
+        name_field: Color32::from_rgb(20, 20, 32),
+        name_field_sel: Color32::from_rgb(50, 25, 75),
+        ruler_bg: Color32::from_rgb(16, 16, 26),
+        ruler_label_bg: Color32::from_rgb(16, 16, 26),
+        ruler_text: Color32::from_rgb(180, 200, 230),
+        ruler_tick: Color32::from_rgb(80, 90, 120),
+        tempo_ruler: Color32::from_rgb(0, 180, 200),
+        meter_ruler: Color32::from_rgb(180, 0, 180),
+        marker_ruler: Color32::from_rgb(30, 25, 45),
+        playlist_bg: Color32::from_rgb(14, 14, 22),
+        playlist_alt: Color32::from_rgb(18, 18, 28),
+        grid_line: Color32::from_rgb(35, 30, 50),
+        bar_line: Color32::from_rgb(55, 45, 80),
+        selection: Color32::from_rgba_premultiplied(0, 220, 255, 60),
+        playhead: Color32::from_rgb(255, 0, 128),
+        insertion: Color32::from_rgb(0, 255, 230),
+        solo: Color32::from_rgb(255, 220, 0),
+        mute: Color32::from_rgb(255, 60, 40),
+        rec: Color32::from_rgb(255, 0, 80),
+        input: Color32::from_rgb(0, 240, 140),
+        auto_read: Color32::from_rgb(0, 230, 160),
+        auto_write: Color32::from_rgb(255, 40, 90),
+        auto_touch: Color32::from_rgb(255, 170, 0),
+        auto_latch: Color32::from_rgb(200, 60, 255),
+        meter_green: Color32::from_rgb(0, 255, 170),
+        meter_yellow: Color32::from_rgb(255, 220, 0),
+        meter_red: Color32::from_rgb(255, 0, 80),
+        fader_track: Color32::from_rgb(8, 8, 14),
+        strip_bg: Color32::from_rgb(20, 20, 32),
+        strip_section: Color32::from_rgb(15, 15, 25),
+        slot_bg: Color32::from_rgb(12, 12, 20),
+        automation_line: Color32::from_rgb(0, 255, 230),
+        menu_bar: Color32::from_rgb(12, 12, 20),
+        group_border: Color32::from_rgb(30, 20, 45),
+        mode_off: Color32::from_rgb(15, 25, 25),
+        counter_off: Color32::from_rgb(10, 30, 35),
+        counter_border: Color32::from_rgb(40, 30, 60),
+        counter_rule: Color32::from_rgb(30, 25, 45),
+        tool_bracket_off: Color32::from_rgb(50, 40, 75),
+        row_selected: Color32::from_rgb(45, 25, 65),
+        visible_dot: Color32::from_rgb(0, 220, 255),
+        big_counter_bg: Color32::from_rgb(4, 4, 8),
+        header_selected: Color32::from_rgb(40, 22, 60),
+        strip_selected: Color32::from_rgb(42, 24, 62),
+        marker_text: Color32::from_rgb(220, 240, 255),
+        playlist_lane: Color32::from_rgb(14, 14, 22),
+        universe_bg: Color32::from_rgb(10, 10, 16),
+        universe_view: Color32::from_rgb(0, 220, 255),
+        meter_bg: Color32::from_rgb(6, 6, 10),
+        meter_clip_off: Color32::from_rgb(60, 10, 25),
+        knob_bg: Color32::from_rgb(22, 18, 34),
+        knob_ring: Color32::from_rgb(0, 200, 240),
+        knob_pointer: Color32::from_rgb(255, 0, 128),
+        section_label: Color32::from_rgb(0, 220, 255),
+        slot_well: Color32::from_rgb(24, 20, 36),
+        slot_empty: Color32::from_rgb(18, 16, 28),
+        slot_face: [Color32::from_rgb(50, 40, 80), Color32::from_rgb(38, 30, 62)],
+        slot_bypassed: [Color32::from_rgb(60, 20, 70), Color32::from_rgb(40, 15, 50)],
+        slot_mark: Color32::from_rgb(0, 220, 255),
+        meter_style: MeterStyle::CyberNeon,
+        fader_cap_style: FaderCapStyle::ModernFlat,
+        knob_style: KnobStyle::CyberRing,
+        corner_radius: 0.0,
+        button_radius: 0.0,
+        panel_depth: 0.35,
+    };
+
+    pub const VINTAGE: Tokens = Tokens {
+        window_bg: Color32::from_rgb(38, 35, 32),
+        panel_bg: Color32::from_rgb(46, 42, 38),
+        panel_bg2: Color32::from_rgb(56, 51, 46),
+        toolbar_bg: Color32::from_rgb(42, 38, 34),
+        toolbar_group: Color32::from_rgb(34, 31, 28),
+        border: Color32::from_rgb(24, 22, 20),
+        border_light: Color32::from_rgb(76, 70, 64),
+        edge_light: Color32::from_rgba_premultiplied(90, 80, 65, 30),
+        text: Color32::from_rgb(238, 230, 216),
+        text_dim: Color32::from_rgb(172, 160, 142),
+        text_dark: Color32::from_rgb(18, 16, 14),
+        header_text: Color32::from_rgb(218, 208, 192),
+        counter_bg: Color32::from_rgb(16, 14, 12),
+        counter_text: Color32::from_rgb(255, 185, 55),
+        counter_label: Color32::from_rgb(215, 198, 175),
+        accent: Color32::from_rgb(205, 138, 68),
+        accent_dark: Color32::from_rgb(150, 95, 45),
+        mode_on: Color32::from_rgb(140, 185, 95),
+        mode_on_text: Color32::from_rgb(24, 32, 16),
+        mode_off_text: Color32::from_rgb(125, 165, 85),
+        button: Color32::from_rgb(64, 58, 52),
+        button_hi: Color32::from_rgb(84, 76, 68),
+        button_border: Color32::from_rgb(28, 25, 22),
+        name_field: Color32::from_rgb(220, 212, 198),
+        name_field_sel: Color32::from_rgb(240, 232, 218),
+        ruler_bg: Color32::from_rgb(48, 44, 40),
+        ruler_label_bg: Color32::from_rgb(48, 44, 40),
+        ruler_text: Color32::from_rgb(195, 185, 168),
+        ruler_tick: Color32::from_rgb(112, 104, 94),
+        tempo_ruler: Color32::from_rgb(95, 125, 80),
+        meter_ruler: Color32::from_rgb(140, 110, 75),
+        marker_ruler: Color32::from_rgb(52, 48, 43),
+        playlist_bg: Color32::from_rgb(44, 40, 36),
+        playlist_alt: Color32::from_rgb(48, 44, 40),
+        grid_line: Color32::from_rgb(62, 57, 52),
+        bar_line: Color32::from_rgb(80, 74, 68),
+        selection: Color32::from_rgba_premultiplied(180, 120, 60, 80),
+        playhead: Color32::from_rgb(220, 75, 45),
+        insertion: Color32::from_rgb(240, 230, 215),
+        solo: Color32::from_rgb(215, 175, 40),
+        mute: Color32::from_rgb(210, 105, 35),
+        rec: Color32::from_rgb(195, 52, 42),
+        input: Color32::from_rgb(90, 155, 95),
+        auto_read: Color32::from_rgb(110, 175, 100),
+        auto_write: Color32::from_rgb(200, 65, 55),
+        auto_touch: Color32::from_rgb(215, 150, 45),
+        auto_latch: Color32::from_rgb(160, 115, 190),
+        meter_green: Color32::from_rgb(95, 185, 85),
+        meter_yellow: Color32::from_rgb(245, 185, 50),
+        meter_red: Color32::from_rgb(215, 55, 45),
+        fader_track: Color32::from_rgb(18, 16, 14),
+        strip_bg: Color32::from_rgb(54, 49, 44),
+        strip_section: Color32::from_rgb(44, 40, 36),
+        slot_bg: Color32::from_rgb(34, 31, 28),
+        automation_line: Color32::from_rgb(245, 235, 215),
+        menu_bar: Color32::from_rgb(28, 25, 23),
+        group_border: Color32::from_rgb(14, 12, 11),
+        mode_off: Color32::from_rgb(28, 38, 25),
+        counter_off: Color32::from_rgb(36, 46, 32),
+        counter_border: Color32::from_rgb(58, 52, 46),
+        counter_rule: Color32::from_rgb(48, 43, 38),
+        tool_bracket_off: Color32::from_rgb(74, 68, 62),
+        row_selected: Color32::from_rgb(72, 60, 50),
+        visible_dot: Color32::from_rgb(215, 195, 170),
+        big_counter_bg: Color32::from_rgb(8, 7, 6),
+        header_selected: Color32::from_rgb(68, 58, 48),
+        strip_selected: Color32::from_rgb(70, 60, 50),
+        marker_text: Color32::from_rgb(240, 232, 218),
+        playlist_lane: Color32::from_rgb(38, 34, 30),
+        universe_bg: Color32::from_rgb(24, 21, 19),
+        universe_view: Color32::from_rgb(240, 230, 215),
+        meter_bg: Color32::from_rgb(12, 11, 10),
+        meter_clip_off: Color32::from_rgb(65, 22, 20),
+        knob_bg: Color32::from_rgb(38, 34, 30),
+        knob_ring: Color32::from_rgb(185, 165, 140),
+        knob_pointer: Color32::from_rgb(245, 235, 220),
+        section_label: Color32::from_rgb(215, 195, 170),
+        slot_well: Color32::from_rgb(48, 43, 39),
+        slot_empty: Color32::from_rgb(42, 38, 34),
+        slot_face: [Color32::from_rgb(98, 88, 80), Color32::from_rgb(78, 70, 64)],
+        slot_bypassed: [Color32::from_rgb(95, 85, 115), Color32::from_rgb(75, 65, 95)],
+        slot_mark: Color32::from_rgb(185, 170, 150),
+        meter_style: MeterStyle::VintageVu,
+        fader_cap_style: FaderCapStyle::VintageBakelite,
+        knob_style: KnobStyle::VintageConsole,
+        corner_radius: 1.5,
+        button_radius: 1.5,
+        panel_depth: 0.25,
+    };
+
+    pub const STUDIO_PRO: Tokens = Tokens {
+        window_bg: Color32::from_rgb(18, 19, 23),
+        panel_bg: Color32::from_rgb(24, 26, 31),
+        panel_bg2: Color32::from_rgb(32, 35, 42),
+        toolbar_bg: Color32::from_rgb(20, 22, 27),
+        toolbar_group: Color32::from_rgb(14, 15, 19),
+        border: Color32::from_rgb(10, 11, 14),
+        border_light: Color32::from_rgb(46, 50, 60),
+        edge_light: Color32::from_rgba_premultiplied(40, 45, 55, 30),
+        text: Color32::from_rgb(228, 230, 235),
+        text_dim: Color32::from_rgb(148, 153, 165),
+        text_dark: Color32::from_rgb(10, 12, 15),
+        header_text: Color32::from_rgb(215, 218, 226),
+        counter_bg: Color32::from_rgb(8, 9, 12),
+        counter_text: Color32::from_rgb(0, 225, 255),
+        counter_label: Color32::from_rgb(175, 182, 195),
+        accent: Color32::from_rgb(0, 164, 228),
+        accent_dark: Color32::from_rgb(0, 115, 175),
+        mode_on: Color32::from_rgb(45, 210, 145),
+        mode_on_text: Color32::from_rgb(5, 25, 15),
+        mode_off_text: Color32::from_rgb(60, 175, 130),
+        button: Color32::from_rgb(36, 40, 48),
+        button_hi: Color32::from_rgb(50, 56, 68),
+        button_border: Color32::from_rgb(20, 22, 28),
+        name_field: Color32::from_rgb(215, 220, 228),
+        name_field_sel: Color32::from_rgb(240, 245, 255),
+        ruler_bg: Color32::from_rgb(20, 22, 27),
+        ruler_label_bg: Color32::from_rgb(20, 22, 27),
+        ruler_text: Color32::from_rgb(190, 195, 205),
+        ruler_tick: Color32::from_rgb(70, 76, 88),
+        tempo_ruler: Color32::from_rgb(45, 140, 180),
+        meter_ruler: Color32::from_rgb(160, 120, 50),
+        marker_ruler: Color32::from_rgb(28, 30, 36),
+        playlist_bg: Color32::from_rgb(22, 24, 29),
+        playlist_alt: Color32::from_rgb(26, 28, 34),
+        grid_line: Color32::from_rgb(36, 40, 48),
+        bar_line: Color32::from_rgb(55, 62, 75),
+        selection: Color32::from_rgba_premultiplied(0, 164, 228, 70),
+        playhead: Color32::from_rgb(0, 200, 255),
+        insertion: Color32::from_rgb(255, 255, 255),
+        solo: Color32::from_rgb(245, 190, 25),
+        mute: Color32::from_rgb(235, 65, 75),
+        rec: Color32::from_rgb(245, 45, 55),
+        input: Color32::from_rgb(30, 190, 175),
+        auto_read: Color32::from_rgb(45, 210, 145),
+        auto_write: Color32::from_rgb(235, 65, 75),
+        auto_touch: Color32::from_rgb(245, 180, 30),
+        auto_latch: Color32::from_rgb(180, 110, 225),
+        meter_green: Color32::from_rgb(40, 215, 120),
+        meter_yellow: Color32::from_rgb(255, 200, 30),
+        meter_red: Color32::from_rgb(255, 45, 55),
+        fader_track: Color32::from_rgb(12, 13, 17),
+        strip_bg: Color32::from_rgb(25, 27, 33),
+        strip_section: Color32::from_rgb(20, 22, 27),
+        slot_bg: Color32::from_rgb(16, 17, 21),
+        automation_line: Color32::from_rgb(0, 180, 240),
+        menu_bar: Color32::from_rgb(16, 17, 21),
+        group_border: Color32::from_rgb(10, 11, 14),
+        mode_off: Color32::from_rgb(18, 28, 22),
+        counter_off: Color32::from_rgb(15, 30, 24),
+        counter_border: Color32::from_rgb(35, 42, 52),
+        counter_rule: Color32::from_rgb(26, 30, 38),
+        tool_bracket_off: Color32::from_rgb(50, 56, 68),
+        row_selected: Color32::from_rgb(32, 48, 70),
+        visible_dot: Color32::from_rgb(0, 164, 228),
+        big_counter_bg: Color32::from_rgb(6, 7, 9),
+        header_selected: Color32::from_rgb(36, 46, 64),
+        strip_selected: Color32::from_rgb(34, 44, 62),
+        marker_text: Color32::from_rgb(235, 240, 250),
+        playlist_lane: Color32::from_rgb(20, 22, 27),
+        universe_bg: Color32::from_rgb(14, 15, 19),
+        universe_view: Color32::from_rgb(0, 164, 228),
+        meter_bg: Color32::from_rgb(8, 9, 12),
+        meter_clip_off: Color32::from_rgb(55, 18, 22),
+        knob_bg: Color32::from_rgb(24, 26, 32),
+        knob_ring: Color32::from_rgb(0, 164, 228),
+        knob_pointer: Color32::from_rgb(255, 255, 255),
+        section_label: Color32::from_rgb(165, 175, 195),
+        slot_well: Color32::from_rgb(20, 22, 27),
+        slot_empty: Color32::from_rgb(16, 17, 21),
+        slot_face: [Color32::from_rgb(45, 52, 65), Color32::from_rgb(35, 40, 50)],
+        slot_bypassed: [Color32::from_rgb(60, 50, 75), Color32::from_rgb(45, 38, 58)],
+        slot_mark: Color32::from_rgb(0, 180, 240),
+        meter_style: MeterStyle::Segmented12Led,
+        fader_cap_style: FaderCapStyle::StudioPro,
+        knob_style: KnobStyle::StudioSleek,
+        corner_radius: 4.0,
+        button_radius: 3.0,
+        panel_depth: 0.22,
+    };
+
+    pub const FL_STUDIO: Tokens = Tokens {
+        window_bg: Color32::from_rgb(26, 28, 34),
+        panel_bg: Color32::from_rgb(34, 37, 44),
+        panel_bg2: Color32::from_rgb(42, 46, 56),
+        toolbar_bg: Color32::from_rgb(28, 30, 36),
+        toolbar_group: Color32::from_rgb(20, 22, 26),
+        border: Color32::from_rgb(14, 15, 18),
+        border_light: Color32::from_rgb(52, 56, 68),
+        edge_light: Color32::from_rgba_premultiplied(50, 55, 68, 30),
+        text: Color32::from_rgb(230, 234, 240),
+        text_dim: Color32::from_rgb(155, 162, 175),
+        text_dark: Color32::from_rgb(12, 14, 18),
+        header_text: Color32::from_rgb(220, 225, 235),
+        counter_bg: Color32::from_rgb(10, 11, 14),
+        counter_text: Color32::from_rgb(255, 140, 34),
+        counter_label: Color32::from_rgb(180, 188, 200),
+        accent: Color32::from_rgb(255, 133, 34),
+        accent_dark: Color32::from_rgb(195, 90, 15),
+        mode_on: Color32::from_rgb(57, 230, 114),
+        mode_on_text: Color32::from_rgb(5, 25, 12),
+        mode_off_text: Color32::from_rgb(45, 180, 90),
+        button: Color32::from_rgb(45, 49, 58),
+        button_hi: Color32::from_rgb(60, 66, 78),
+        button_border: Color32::from_rgb(22, 24, 30),
+        name_field: Color32::from_rgb(220, 224, 232),
+        name_field_sel: Color32::from_rgb(245, 248, 255),
+        ruler_bg: Color32::from_rgb(28, 30, 36),
+        ruler_label_bg: Color32::from_rgb(28, 30, 36),
+        ruler_text: Color32::from_rgb(195, 200, 210),
+        ruler_tick: Color32::from_rgb(75, 82, 95),
+        tempo_ruler: Color32::from_rgb(255, 133, 34),
+        meter_ruler: Color32::from_rgb(0, 180, 220),
+        marker_ruler: Color32::from_rgb(32, 35, 42),
+        playlist_bg: Color32::from_rgb(27, 29, 36),
+        playlist_alt: Color32::from_rgb(31, 34, 42),
+        grid_line: Color32::from_rgb(42, 46, 56),
+        bar_line: Color32::from_rgb(65, 72, 88),
+        selection: Color32::from_rgba_premultiplied(255, 133, 34, 75),
+        playhead: Color32::from_rgb(255, 145, 40),
+        insertion: Color32::from_rgb(255, 255, 255),
+        solo: Color32::from_rgb(255, 208, 36),
+        mute: Color32::from_rgb(255, 133, 34),
+        rec: Color32::from_rgb(255, 55, 65),
+        input: Color32::from_rgb(57, 230, 114),
+        auto_read: Color32::from_rgb(57, 230, 114),
+        auto_write: Color32::from_rgb(255, 55, 65),
+        auto_touch: Color32::from_rgb(255, 165, 30),
+        auto_latch: Color32::from_rgb(180, 105, 235),
+        meter_green: Color32::from_rgb(57, 230, 114),
+        meter_yellow: Color32::from_rgb(255, 215, 35),
+        meter_red: Color32::from_rgb(255, 55, 65),
+        fader_track: Color32::from_rgb(14, 15, 19),
+        strip_bg: Color32::from_rgb(32, 35, 43),
+        strip_section: Color32::from_rgb(25, 27, 33),
+        slot_bg: Color32::from_rgb(18, 20, 25),
+        automation_line: Color32::from_rgb(255, 133, 34),
+        menu_bar: Color32::from_rgb(20, 22, 27),
+        group_border: Color32::from_rgb(14, 15, 19),
+        mode_off: Color32::from_rgb(20, 32, 24),
+        counter_off: Color32::from_rgb(18, 34, 26),
+        counter_border: Color32::from_rgb(42, 48, 60),
+        counter_rule: Color32::from_rgb(30, 35, 45),
+        tool_bracket_off: Color32::from_rgb(58, 65, 78),
+        row_selected: Color32::from_rgb(45, 58, 80),
+        visible_dot: Color32::from_rgb(255, 133, 34),
+        big_counter_bg: Color32::from_rgb(8, 9, 12),
+        header_selected: Color32::from_rgb(44, 52, 68),
+        strip_selected: Color32::from_rgb(42, 50, 65),
+        marker_text: Color32::from_rgb(240, 244, 252),
+        playlist_lane: Color32::from_rgb(24, 26, 32),
+        universe_bg: Color32::from_rgb(16, 17, 22),
+        universe_view: Color32::from_rgb(255, 133, 34),
+        meter_bg: Color32::from_rgb(10, 11, 14),
+        meter_clip_off: Color32::from_rgb(60, 18, 22),
+        knob_bg: Color32::from_rgb(28, 31, 38),
+        knob_ring: Color32::from_rgb(255, 133, 34),
+        knob_pointer: Color32::from_rgb(255, 255, 255),
+        section_label: Color32::from_rgb(180, 188, 205),
+        slot_well: Color32::from_rgb(22, 24, 30),
+        slot_empty: Color32::from_rgb(18, 20, 25),
+        slot_face: [Color32::from_rgb(52, 58, 72), Color32::from_rgb(40, 45, 56)],
+        slot_bypassed: [Color32::from_rgb(65, 55, 80), Color32::from_rgb(48, 40, 60)],
+        slot_mark: Color32::from_rgb(255, 133, 34),
+        meter_style: MeterStyle::Segmented12Led,
+        fader_cap_style: FaderCapStyle::TactileMetallic,
+        knob_style: KnobStyle::StudioSleek,
+        corner_radius: 4.0,
+        button_radius: 3.5,
+        panel_depth: 0.25,
     };
 
     pub fn current() -> Tokens {
-        if is_light() { Self::LIGHT } else { Self::DARK }
+        match active_theme() {
+            ThemeMode::Light => Self::LIGHT,
+            ThemeMode::StudioPro => Self::STUDIO_PRO,
+            ThemeMode::FLStudio => Self::FL_STUDIO,
+            ThemeMode::Cyberpunk => Self::CYBERPUNK,
+            ThemeMode::Vintage => Self::VINTAGE,
+            _ => Self::DARK,
+        }
+    }
+}
+
+static ACTIVE_THEME_CODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Active resolved theme mode.
+pub fn active_theme() -> ThemeMode {
+    match ACTIVE_THEME_CODE.load(Ordering::Relaxed) {
+        1 => ThemeMode::Light,
+        2 => ThemeMode::Cyberpunk,
+        3 => ThemeMode::Vintage,
+        4 => ThemeMode::StudioPro,
+        5 => ThemeMode::FLStudio,
+        _ => ThemeMode::Dark,
     }
 }
 
 /// Whether the Light palette is the active one.
 pub fn is_light() -> bool {
-    LIGHT_THEME.load(Ordering::Relaxed)
+    active_theme() == ThemeMode::Light
 }
 
 /// Resolve each frame from the integration's current OS appearance. Unknown uses Dark.
 pub fn wants_light(ctx: &egui::Context, mode: ThemeMode) -> bool {
     match mode {
         ThemeMode::Light => true,
-        ThemeMode::Dark => false,
+        ThemeMode::Dark | ThemeMode::StudioPro | ThemeMode::FLStudio | ThemeMode::Cyberpunk | ThemeMode::Vintage => false,
         ThemeMode::System => ctx.system_theme() == Some(egui::Theme::Light),
     }
+}
+
+/// Apply a specific ThemeMode to egui Context visuals.
+pub fn apply_mode(ctx: &egui::Context, mode: ThemeMode) {
+    let resolved = match mode {
+        ThemeMode::System => {
+            if ctx.system_theme() == Some(egui::Theme::Light) {
+                ThemeMode::Light
+            } else {
+                ThemeMode::Dark
+            }
+        }
+        m => m,
+    };
+    let code = match resolved {
+        ThemeMode::Light => 1,
+        ThemeMode::Cyberpunk => 2,
+        ThemeMode::Vintage => 3,
+        ThemeMode::StudioPro => 4,
+        ThemeMode::FLStudio => 5,
+        _ => 0,
+    };
+    ACTIVE_THEME_CODE.store(code, Ordering::Relaxed);
+    LIGHT_THEME.store(resolved == ThemeMode::Light, Ordering::Relaxed);
+    let t = Tokens::current();
+    let mut v = if resolved == ThemeMode::Light { egui::Visuals::light() } else { egui::Visuals::dark() };
+    v.panel_fill = t.panel_bg;
+    v.window_fill = t.panel_bg2;
+    v.extreme_bg_color = t.slot_bg;
+    v.faint_bg_color = t.panel_bg2;
+    v.selection.bg_fill = t.accent;
+    v.widgets.inactive.weak_bg_fill = t.button;
+    v.widgets.inactive.bg_fill = t.button;
+    v.widgets.hovered.weak_bg_fill = t.button_hi;
+    v.widgets.noninteractive.fg_stroke.color = t.text;
+    v.widgets.inactive.fg_stroke.color = t.text;
+    v.window_corner_radius = egui::CornerRadius::same(t.corner_radius.round() as u8);
+    v.menu_corner_radius = egui::CornerRadius::same(t.button_radius.round() as u8);
+    v.widgets.inactive.corner_radius = egui::CornerRadius::same(t.button_radius.round() as u8);
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(t.button_radius.round() as u8);
+    v.widgets.active.corner_radius = egui::CornerRadius::same(t.button_radius.round() as u8);
+    ctx.set_theme(egui::ThemePreference::System);
+    ctx.all_styles_mut(|s| {
+        s.visuals = v.clone();
+        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+        s.spacing.button_padding = egui::vec2(6.0, 2.0);
+        s.interaction.tooltip_delay = 0.4;
+    });
+}
+
+/// Make `light` (or dark) the active palette and apply its visuals. Call only when it changes.
+pub fn apply(ctx: &egui::Context, light: bool) {
+    apply_mode(ctx, if light { ThemeMode::Light } else { ThemeMode::Dark });
 }
 
 /// A track's header and lane backgrounds in the Edit window, tinted with its colour by `tint` (0..1).
@@ -447,36 +976,6 @@ pub fn regular(size: f32) -> FontId {
 
 pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
-}
-
-/// Make `light` (or dark) the active palette and apply its visuals. Call only when it changes.
-pub fn apply(ctx: &egui::Context, light: bool) {
-    LIGHT_THEME.store(light, Ordering::Relaxed);
-    let t = Tokens::current();
-    let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
-    v.panel_fill = t.panel_bg;
-    v.window_fill = t.panel_bg2;
-    v.extreme_bg_color = t.slot_bg;
-    v.faint_bg_color = t.panel_bg2;
-    v.selection.bg_fill = t.accent;
-    v.widgets.inactive.weak_bg_fill = t.button;
-    v.widgets.inactive.bg_fill = t.button;
-    v.widgets.hovered.weak_bg_fill = t.button_hi;
-    v.widgets.noninteractive.fg_stroke.color = t.text;
-    v.widgets.inactive.fg_stroke.color = t.text;
-    v.window_corner_radius = egui::CornerRadius::same(6);
-    v.menu_corner_radius = egui::CornerRadius::same(4);
-    // Keep receiving native OS appearance changes even when our palette is manual. On macOS,
-    // pinning egui's theme also pins the window appearance and hides later OS changes.
-    ctx.set_theme(egui::ThemePreference::System);
-    // Both egui style branches must use our resolved palette: egui can select either branch
-    // as the OS changes, including while SoundCraft's manual Light/Dark choice stays fixed.
-    ctx.all_styles_mut(|s| {
-        s.visuals = v.clone();
-        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        s.spacing.button_padding = egui::vec2(6.0, 2.0);
-        s.interaction.tooltip_delay = 0.4;
-    });
 }
 
 #[cfg(test)]

@@ -1,0 +1,1 @@
+../packaging/linux/setup_msc_bluetooth.sh

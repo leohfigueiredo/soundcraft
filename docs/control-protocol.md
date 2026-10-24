@@ -55,6 +55,13 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `ui.key` | `{key, cmd?, shift?, alt?, ctrl?}` | Key press (`Space`, `Enter`, `A`, `F7`, `=`…). |
 | `ui.text` | `{text}` | Type text into the focused field. |
 | `ui.screenshot` | `{path?}` | PNG of the window (base64 in `png_base64` when no path). |
+| `mixer.meters` | `{}` | Per-track and master meters (`peak`, `peak_db`, `level`, `hold`, `clip`, `gr`), whether the transport is playing, and `dropouts`/`blocks` from the output device: the answer to "is there sound?" and "is the sound path keeping up?". |
+| `plugin.programs` | `{track, slot?}` | The preset banks a hosted plugin publishes (VST3 `IUnitInfo`): `{lists: [{id, name, programs: [...]}]}`. |
+| `plugin.program` | `{track, list, program, slot?}` | Selects one of those programs (through the `kIsProgramChange` parameter, forwarded to the processor). |
+| `plugin.state` | `{track, slot?}` | `{bytes, hash}`: a fingerprint of the live plugin state, to prove a change happened. |
+| `preset.save` | `{track, profile, name, slot?}` | Binds the live plugin state to a name in `presets/<profile>.json`. |
+| `preset.apply` | `{track, profile, name, slot?}` | Restores that state into the live plugin. |
+| `midi.live` | `{track, bytes: [status, data1, data2]}` | One live MIDI message to an instrument track, along the hardware-keyboard path: a note proves the instrument sounds, `[192, n, 0]` tests whether a VST honours program changes. |
 | `app.quit` | `{}` | Quit. |
 
 ## Positions and references

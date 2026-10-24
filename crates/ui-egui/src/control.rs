@@ -16,6 +16,21 @@ use crate::SoundApp;
 use serde_json::{Value, json};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+/// `slot`: an insert index (`0`…), `"instrument"`, or absent for the instrument.
+fn slot_of(p: &Value) -> Option<usize> {
+    match p.get("slot") {
+        None => None,
+        Some(Value::String(s)) if s == "instrument" => Some(soundcraft_mix::INSTRUMENT_SLOT),
+        Some(Value::Number(n)) => n.as_u64().map(|n| n as usize),
+        _ => None,
+    }
+}
+
+/// A linear peak as decibels, for a meter readout (`-inf` for silence).
+fn db(peak: f32) -> f32 {
+    if peak > 0.0 { 20.0 * peak.log10() } else { f32::NEG_INFINITY }
+}
+
 pub struct ControlRequest {
     pub method: String,
     pub params: Value,
@@ -205,6 +220,21 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
             app.synthetic.extend((0..steps).map(|_| egui::Event::Zoom(each)));
             ok(json!({}))
         }
+        // Raw pointer button state, so a press-and-hold can be automated (a click is not enough to
+        // see whether something retriggers while the button stays down).
+        "ui.pointer" => {
+            let x = p.get("x").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let y = p.get("y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let down = p.get("down").and_then(Value::as_bool).unwrap_or(false);
+            app.synthetic.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+            app.synthetic.push(egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: down,
+                modifiers: mods(p),
+            });
+            ok(json!({"x": x, "y": y, "down": down}))
+        }
         "ui.key" => {
             let name = p.get("key").and_then(Value::as_str).unwrap_or("");
             let Some(key) = key_from(name) else { return Some(err(format!("unknown key `{name}`"))) };
@@ -231,6 +261,119 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
             });
             ctx.request_repaint();
             return None;
+        }
+        // The live MIDI the keyboard and the console actually sent (bounded): what a stuck note or
+        // a retrigger looks like from the outside.
+        "ui.midi_log" => ok(json!({
+            "sent": app.live_midi_log.iter().map(|(track, m)| json!({"track": track, "bytes": m})).collect::<Vec<_>>(),
+            "held": app.keyboard.held_notes.iter().copied().collect::<Vec<u8>>(),
+            "typed": app.keyboard.typed_notes.iter().copied().collect::<Vec<u8>>(),
+            "last_clicked": app.keyboard.last_clicked,
+        })),
+        // What the meters say, per track and for the master: the answer to "is there sound?".
+        // Peaks are linear (0…1+), the same numbers the channel strips show.
+        "mixer.meters" => {
+            let mut tracks = serde_json::Map::new();
+            for (id, m) in &app.meters {
+                let peak = m.level.iter().copied().fold(0.0_f32, f32::max);
+                tracks.insert(
+                    id.0.to_string(),
+                    json!({"peak": peak, "peak_db": db(peak), "level": m.level, "hold": m.hold, "clip": m.clip, "gr": m.gr}),
+                );
+            }
+            let master = app.engine.session().tracks.iter().find(|t| t.kind == soundcraft_model::TrackKind::Master).map(|t| t.id);
+            let playing = app.is_playing();
+            let (dropouts, blocks) = app.player.as_ref().map(|p| p.audio_dropouts()).unwrap_or((0, 0));
+            ok(json!({"tracks": tracks, "master": master.map(|m| m.0), "playing": playing, "dropouts": dropouts, "blocks": blocks}))
+        }
+        // The preset banks a hosted plugin publishes, and selecting one: the instrument→preset map
+        // a console uses, reachable from a script.
+        "plugin.programs" => {
+            let Some(track) = p.get("track").and_then(Value::as_u64).map(soundcraft_model::TrackId) else {
+                return Some(err("plugin.programs needs `track`"));
+            };
+            let slot = slot_of(p).unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
+            let lists = app.player.as_ref().map(|pl| pl.plugin_programs(track, slot)).unwrap_or_default();
+            ok(json!({"lists": lists}))
+        }
+        "plugin.program" => {
+            let Some(track) = p.get("track").and_then(Value::as_u64).map(soundcraft_model::TrackId) else {
+                return Some(err("plugin.program needs `track`"));
+            };
+            let (Some(list), Some(program)) = (p.get("list").and_then(Value::as_u64), p.get("program").and_then(Value::as_u64)) else {
+                return Some(err("plugin.program needs `list` and `program`"));
+            };
+            let slot = slot_of(p).unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
+            if let Some(pl) = app.player.as_ref() {
+                pl.select_plugin_program(track, slot, list as usize, program as usize);
+            }
+            ok(json!({"track": track.0, "list": list, "program": program}))
+        }
+        // A fingerprint of a live plugin's state: "did that program change actually do anything?".
+        "plugin.state" => {
+            let Some(track) = p.get("track").and_then(Value::as_u64).map(soundcraft_model::TrackId) else {
+                return Some(err("plugin.state needs `track`"));
+            };
+            let slot = slot_of(p).unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
+            let state = app.player.as_ref().and_then(|pl| pl.capture_plugin_state(track, slot));
+            match state {
+                None => ok(json!({"track": track.0, "bytes": 0, "hash": null})),
+                Some(bytes) => {
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for b in &bytes {
+                        h ^= u64::from(*b);
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    ok(json!({"track": track.0, "bytes": bytes.len(), "hash": format!("{h:016x}")}))
+                }
+            }
+        }
+        // The instrument→preset map, from a script: bind the live sound to a name, restore it later.
+        "preset.save" => {
+            let Some(track) = p.get("track").and_then(Value::as_u64).map(soundcraft_model::TrackId) else {
+                return Some(err("preset.save needs `track`"));
+            };
+            let Some(name) = p.get("name").and_then(Value::as_str) else { return Some(err("preset.save needs `name`")) };
+            let profile = p.get("profile").and_then(Value::as_str).unwrap_or("custom");
+            let slot = slot_of(p).unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
+            let Some(state) = app.player.as_ref().and_then(|pl| pl.capture_plugin_state(track, slot)) else {
+                return Some(err("that plugin handed over no state"));
+            };
+            let mut map = crate::console_kit::saved_presets(profile);
+            map.insert(name.to_string(), soundcraft_engine::model::b64::encode(&state));
+            match crate::console_kit::write_saved_presets(profile, &map) {
+                Ok(()) => ok(json!({"name": name, "bytes": state.len()})),
+                Err(e) => err(e),
+            }
+        }
+        "preset.apply" => {
+            let Some(track) = p.get("track").and_then(Value::as_u64).map(soundcraft_model::TrackId) else {
+                return Some(err("preset.apply needs `track`"));
+            };
+            let Some(name) = p.get("name").and_then(Value::as_str) else { return Some(err("preset.apply needs `name`")) };
+            let profile = p.get("profile").and_then(Value::as_str).unwrap_or("custom");
+            let slot = slot_of(p).unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
+            let Some(state) = crate::console_kit::saved_presets(profile).get(name).and_then(|b| soundcraft_engine::model::b64::decode(b)) else {
+                return Some(err(format!("no preset `{name}` in the `{profile}` map")));
+            };
+            let bytes = state.len();
+            if let Some(pl) = app.player.as_ref() {
+                pl.load_plugin_state(track, slot, state);
+            }
+            ok(json!({"name": name, "bytes": bytes}))
+        }
+        // One live MIDI message to an instrument track (a note, a controller, a program change):
+        // the same path a hardware keyboard takes, which is how "does this actually sound?" and
+        // "does this VST listen to program changes?" can be answered without touching the mouse.
+        "midi.live" => {
+            let Some(track) = p.get("track").and_then(Value::as_u64).map(soundcraft_model::TrackId) else {
+                return Some(err("midi.live needs `track`"));
+            };
+            let bytes: Vec<u8> =
+                p.get("bytes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|b| b as u8).collect()).unwrap_or_default();
+            let [status, data1, data2, ..] = bytes[..] else { return Some(err("midi.live needs `bytes`: [status, data1, data2]")) };
+            app.send_live_midi(track, [status, data1, data2]);
+            ok(json!({"track": track.0, "sent": [status, data1, data2]}))
         }
         "app.quit" => {
             app.quit_requested = true;

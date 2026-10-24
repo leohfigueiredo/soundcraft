@@ -1,0 +1,18 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SoundCraft
+GenericName=Digital Audio Workstation
+Comment=Professional DAW with Mackie Control Universal & Studio Pro Theme
+Exec=/home/leonardo/.local/bin/soundcraft %F
+Icon=/home/leonardo/.local/share/icons/soundcraft.png
+Terminal=false
+StartupNotify=true
+StartupWMClass=soundcraft
+Categories=AudioVideo;Audio;Midi;Mixer;Sequencer;Recorder;
+Keywords=daw;audio;mixer;recording;multitrack;midi;editor;music;mackie;mcu;m-vave;
+Actions=Demo;
+
+[Desktop Action Demo]
+Name=Launch Demo Session
+Exec=/home/leonardo/.local/bin/soundcraft --demo

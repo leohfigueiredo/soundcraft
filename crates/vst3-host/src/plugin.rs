@@ -367,6 +367,13 @@ impl Plugin for Vst3Plugin {
     fn set_transport(&mut self, transport: &Transport) {
         self.transport = Some(*transport);
     }
+    fn set_sample(&mut self, sample: Option<Arc<dyn soundcraft_dsp::SampleSource>>) -> bool {
+        if let Some(_s) = sample {
+            true
+        } else {
+            false
+        }
+    }
 
     fn tail_samples(&self) -> usize {
         self.tail

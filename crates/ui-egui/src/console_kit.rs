@@ -1205,7 +1205,11 @@ fn header(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
         });
         if !profile.models.is_empty() {
             ui.add_space(6.0);
+            model_picker(app, ui, profile);
+            ui.add_space(4.0);
             model_tabs(app, ui, profile);
+            ui.add_space(4.0);
+            captured_preset_browser(app, ui, profile);
         }
         if let Some((_, id)) = profile.library_picker {
             let list = libraries();
@@ -1241,7 +1245,6 @@ fn header(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
     });
 }
 
-#[allow(dead_code)]
 fn captured_preset_browser(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
     let p = profile.palette;
     let mut capture_name = state(app, profile).capture_name.clone();
@@ -1307,6 +1310,84 @@ fn captured_preset_browser(app: &mut SoundApp, ui: &mut Ui, profile: &'static Pr
     console.selected_capture = selected;
 }
 
+/// Selects instrument `index` of `profile` and loads its sound (program, saved state, or a MIDI
+/// program change). Shared by the instrument buttons, the search picker and the prev/next arrows.
+fn choose_model(app: &mut SoundApp, profile: &'static Profile, index: usize) {
+    let Some(model) = profile.models.get(index) else { return };
+    state_mut(app, profile).model = index;
+    let (applied, status) = apply_preset(app, profile, model);
+    app.ui.status = if applied {
+        status
+    } else if let Some(track) = crate::virtual_keyboard::active_target_track(app) {
+        if profile.program_change {
+            let msg = [0xC0 | (state(app, profile).channel & 0x0F), model.program, 0];
+            app.send_live_midi(track, msg);
+            record_sent(app, msg);
+            format!("Loaded {} (program {})", model.name, model.program)
+        } else {
+            crate::mix_window::open_native_gui(app, track, soundcraft_mix::INSTRUMENT_SLOT);
+            format!("{status}; opened the plugin to pick the sound")
+        }
+    } else {
+        format!("{status}; no {} track is loaded", profile.brand)
+    };
+}
+
+/// Search box + dropdown + previous/next arrows over every instrument of the console, so a long
+/// list (Omnisphere 45, Pianoteq 36) is one keystroke away. A dot marks instruments that have a
+/// saved sound bound to them.
+fn model_picker(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
+    let p = profile.palette;
+    let count = profile.models.len();
+    if count == 0 {
+        return;
+    }
+    let selected = state(app, profile).model.min(count - 1);
+    let bound = saved_presets(profile.id);
+    let filter_id = ui.make_persistent_id(("model_filter", profile.id));
+    let mut filter: String = ui.data_mut(|d| d.get_temp(filter_id)).unwrap_or_default();
+    let mut pick: Option<usize> = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("FIND").font(bold(8.5)).color(p.text_dim));
+        if ui.add(egui::Button::new("◀").small()).on_hover_text("Previous instrument").clicked() {
+            pick = Some((selected + count - 1) % count);
+        }
+        let shown = profile.models.get(selected).map(|m| m.name).unwrap_or("—");
+        egui::ComboBox::from_id_salt(("model_picker", profile.id)).selected_text(shown).width(190.0).height(360.0).show_ui(ui, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut filter).hint_text("type to filter…").desired_width(170.0));
+            ui.separator();
+            let needle = filter.trim().to_ascii_lowercase();
+            for (category, cat) in profile.categories.iter().enumerate() {
+                let rows: Vec<(usize, &Model)> = profile
+                    .models
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.category == category && (needle.is_empty() || m.name.to_ascii_lowercase().contains(&needle)))
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                ui.label(RichText::new(cat.title).font(bold(8.0)).color(p.text_dim));
+                for (i, m) in rows {
+                    let dot = if bound.contains_key(preset_key(m)) { "● " } else { "   " };
+                    if ui.selectable_label(i == selected, format!("{dot}{}", m.name)).clicked() {
+                        pick = Some(i);
+                        ui.close();
+                    }
+                }
+            }
+        });
+        if ui.add(egui::Button::new("▶").small()).on_hover_text("Next instrument").clicked() {
+            pick = Some((selected + 1) % count);
+        }
+        ui.label(RichText::new(format!("{} / {}", selected + 1, count)).font(regular(8.5)).color(p.text_dim));
+    });
+    ui.data_mut(|d| d.insert_temp(filter_id, filter));
+    if let Some(i) = pick {
+        choose_model(app, profile, i);
+    }
+}
+
 fn model_tabs(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
     let p = profile.palette;
     let selected = state(app, profile).model;
@@ -1352,25 +1433,7 @@ fn model_tabs(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
                     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, info_selected, info_label));
                     let resp = resp.on_hover_text(format!("{} — program {} (click or double-click to load)", model.name, model.program));
                     if resp.clicked() || resp.double_clicked() {
-                        state_mut(app, profile).model = i;
-                        let (applied, status) = apply_preset(app, profile, model);
-                        app.ui.status = if applied {
-                            status
-                        } else {
-                            if let Some(track) = crate::virtual_keyboard::active_target_track(app) {
-                                if profile.program_change {
-                                    let msg = [0xC0 | (state(app, profile).channel & 0x0F), model.program, 0];
-                                    app.send_live_midi(track, msg);
-                                    record_sent(app, msg);
-                                    format!("Loaded {} (program {})", model.name, model.program)
-                                } else {
-                                    crate::mix_window::open_native_gui(app, track, soundcraft_mix::INSTRUMENT_SLOT);
-                                    format!("{status}; opened the plugin to pick the sound")
-                                }
-                            } else {
-                                format!("{status}; no {} track is loaded", profile.brand)
-                            }
-                        };
+                        choose_model(app, profile, i);
                     }
                 }
             });

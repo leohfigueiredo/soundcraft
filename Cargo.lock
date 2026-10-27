@@ -3620,6 +3620,7 @@ dependencies = [
  "soundcraft-engine",
  "soundcraft-playback",
  "soundcraft-ui-egui",
+ "soundcraft-vst2-host",
  "soundcraft-vst3-host",
  "winit",
  "winresource",
@@ -3821,6 +3822,19 @@ dependencies = [
  "rayon",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "soundcraft-vst2-host"
+version = "0.7.0"
+dependencies = [
+ "libloading 0.8.9",
+ "log",
+ "serde",
+ "serde_json",
+ "soundcraft-dsp",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

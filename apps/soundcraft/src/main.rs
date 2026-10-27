@@ -224,6 +224,8 @@ fn probe_plugin(path: &str, id: &str) -> bool {
             soundcraft_clap_host::adopt_scan(descriptors);
         }
         soundcraft_clap_host::instantiate(id).map_err(|e| e.to_string())
+    } else if id.starts_with("vst2:") {
+        soundcraft_vst2_host::create(id).ok_or_else(|| "cannot instantiate vst2".to_string())
     } else {
         return false;
     };
@@ -254,8 +256,12 @@ fn probe_plugin(path: &str, id: &str) -> bool {
     // the probe loads a second one while the first is still alive.
     let made = if id.starts_with("vst3:") {
         soundcraft_vst3_host::instantiate(id).map_err(|e| e.to_string())
-    } else {
+    } else if id.starts_with("clap:") {
         soundcraft_clap_host::instantiate(id).map_err(|e| e.to_string())
+    } else if id.starts_with("vst2:") {
+        soundcraft_vst2_host::create(id).ok_or_else(|| "cannot instantiate vst2".to_string())
+    } else {
+        return false;
     };
     let Ok(mut second) = made else { return false };
     second.prepare(48_000.0, 512, 2);
@@ -294,6 +300,8 @@ fn verify_plugin(path: &str, id: &str, with_editor: bool, editor_hold_ms: u64, p
         soundcraft_clap_host::load_bundle(bundle).map_err(|e| e.to_string()).map(|d| {
             soundcraft_clap_host::adopt_scan(d);
         })
+    } else if id.starts_with("vst2:") {
+        Ok(())
     } else {
         Err(format!("not a hosted plugin id: {id}"))
     };
@@ -310,6 +318,10 @@ fn verify_plugin(path: &str, id: &str, with_editor: bool, editor_hold_ms: u64, p
     stage("instantiate");
     let made = if id.starts_with("vst3:") {
         soundcraft_vst3_host::instantiate(id).map_err(|e| e.to_string())
+    } else if id.starts_with("clap:") {
+        soundcraft_clap_host::instantiate(id).map_err(|e| e.to_string())
+    } else if id.starts_with("vst2:") {
+        soundcraft_vst2_host::create(id).ok_or_else(|| "cannot instantiate vst2".to_string())
     } else {
         soundcraft_clap_host::instantiate(id).map_err(|e| e.to_string())
     };
@@ -362,8 +374,15 @@ fn verify_plugin(path: &str, id: &str, with_editor: bool, editor_hold_ms: u64, p
         report.insert("state_file_tries".into(), serde_json::Value::from(tried));
     }
 
+    stage("prepare");
+    plugin.prepare(48_000.0, 512, 2);
+    plugin.reset();
+    report.insert("latency".into(), serde_json::Value::from(plugin.latency()));
+
     // `--program N`: select a program and report whether the plugin's own values moved, which is
-    // the difference between "the bank exists" and "the host can actually switch it".
+    // the difference between "the bank exists" and "the host can actually switch it". This has to
+    // run *after* `prepare`/`reset`: a program change is queued as an input event, and reset
+    // discards the queue — measuring before it reported every plugin as "selected, unchanged".
     if let Some(index) = program {
         let fingerprint = |p: &dyn soundcraft_dsp::Plugin| -> String {
             use std::fmt::Write as _;
@@ -377,16 +396,14 @@ fn verify_plugin(path: &str, id: &str, with_editor: bool, editor_hold_ms: u64, p
         };
         let before = fingerprint(plugin.as_ref());
         let selected = plugin.select_program(0, index);
+        // One block, so the change is actually consumed by the plugin before it is measured.
+        let mut warmup = vec![vec![0.0f32; 512], vec![0.0f32; 512]];
+        plugin.process(&mut warmup, 512);
         let after = fingerprint(plugin.as_ref());
         report.insert("program".into(), serde_json::Value::from(index));
         report.insert("program_selected".into(), serde_json::Value::Bool(selected));
         report.insert("program_changed_values".into(), serde_json::Value::Bool(before != after));
     }
-
-    stage("prepare");
-    plugin.prepare(48_000.0, 512, 2);
-    plugin.reset();
-    report.insert("latency".into(), serde_json::Value::from(plugin.latency()));
 
     stage("process");
     // Two blocks: one of silence and one with a test tone or a note, so a plugin that only

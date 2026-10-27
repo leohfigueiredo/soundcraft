@@ -1,6 +1,6 @@
 # Plugin parity: built-in processors and plugin hosting
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** minor (insert and instrument commands resolve bridged plugins from the catalogue, never loading them on the UI thread; plugin validation moved off the UI thread with a visible state in the FX list) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-24 · **Change:** minor (added built-in SoundFont 2 player instrument and Craft Console SF2 profile; added clean-room soundcraft-vst2-host with yabridge Pianoteq 6 support) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Pro Tools users live in plugins: the bundled set covers everyday mixing, and third-party plugins
 cover the rest. This doc tracks both. Our plugins have our own names and are written from
@@ -22,7 +22,7 @@ plugin is now measured rather than assumed: see [plugin-verification.md](plugin-
 | Harmonic | lo-fi, rectifier, amp simulation, saturation, tape | `lofi`, `rectifier`, `saturator` | Amp and cabinet models, tape |
 | Pitch and time | pitch shift, varispeed effects, time shift | `pitch_shifter`, `time_shift` | Formant control, varispeed effect, pitch correction |
 | Utility | trim, gain, invert, DC offset, signal generator, dither, time adjuster | `trim`, `gain`, `invert`, `dc_offset_removal`, `signal_generator`, `dither` | Time adjuster, meter/analyzer plugins, noise shaping options |
-| Instruments | several virtual instruments (multi-sampler, piano, drum machine, organ, synths, sample player; Massive X Player added in 2026.4) | `subtractive_synth`, `drum_synth`; `mix.instrument` takes the instrument's parameters in `params` and refuses unknown fields (#265) | Sampler (PR #108 open), piano, organ, wavetable, content library |
+| Instruments | several virtual instruments (multi-sampler, piano, drum machine, organ, synths, sample player; Massive X Player added in 2026.4) | `subtractive_synth`, `drum_synth`, `soundfont` (64-voice SF2 player with Hermite interpolation, ADSR, cutoff, tuning); `mix.soundfont_load` command and Craft Console profile | Sampler (PR #108 open), piano, organ, wavetable, content library |
 | **Total** | **≈ 80 processors and instruments** (estimate from Avid's bundle documentation) | **26 processors + 2 instruments** | |
 
 AudioSuite: every catalog AudioSuite leaf maps to one of our processes (`AUDIOSUITE` in
@@ -39,7 +39,8 @@ User report #152: a saved instrument level does not reach the bounce.
 | Feature | Pro Tools | SoundCraft | Notes |
 |---|---|---|---|
 | Plugin format | AAX only (Native and DSP) | CLAP, VST3, Audio Units (macOS) | Users' libraries mostly ship VST3/AU too. AAX (#109) needs Avid's SDK licence and PACE signing: owner decision, likely never |
-| VST2, LV2, LADSPA | — | ❌ (#30) | Beyond Pro Tools; VST2 SDK is no longer licensable |
+| VST2 | — | ✅ | Clean-room `soundcraft-vst2-host` crate (Layer 1). Hand-written FFI, scans `~/.vst`, `~/.vst/yabridge`, `/usr/lib/vst`. Tested live with Pianoteq 6 via yabridge. |
+| LV2, LADSPA | — | ❌ (#30) | Beyond Pro Tools |
 | Scan, vendor menus, instrument picker | ✅ | ✅ | #23 |
 | Audio, parameters, automation, latency (PDC) | ✅ | ✅ | |
 | Notes / MIDI to instruments | ✅ | ✅ | But no live MIDI input (G-02) |

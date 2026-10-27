@@ -20,6 +20,7 @@ jack = ["soundcraft-playback/jack"]
 soundcraft-engine.workspace = true
 soundcraft-ui-egui.workspace = true
 soundcraft-playback.workspace = true
+soundcraft-vst2-host.workspace = true
 soundcraft-vst3-host.workspace = true
 soundcraft-clap-host.workspace = true
 soundcraft-dsp.workspace = true

@@ -55,6 +55,64 @@ def meta_names(root):
     return out
 
 
+
+def scan_plugins_folder():
+    """Scan mounted Pianote/Plugins folders for Kontakt libraries (.nicnt and .nki)."""
+    found = {}
+    search_dirs = [
+        Path("/run/media/leonardo/Elements/Pianote/Plugins"),
+    ]
+    for base in Path("/run/media").glob("*/*"):
+        if base.name.lower() in ("plugins", "kontakt samples", "pianote"):
+            if base not in search_dirs:
+                search_dirs.append(base)
+
+    for base in search_dirs:
+        if not base.exists():
+            continue
+        for root, dirs, files in os.walk(base):
+            nkis = [f for f in files if f.lower().endswith(".nki") and not f.startswith("._")]
+            nicnts = [f for f in files if f.lower().endswith(".nicnt") and not f.startswith("._")]
+            if nicnts:
+                nicnt_path = Path(root) / nicnts[0]
+                try:
+                    import xml.etree.ElementTree as ET
+                    raw = nicnt_path.read_bytes()
+                    idx = raw.find(b"<?xml")
+                    if idx != -1:
+                        end_tag = "</ProductHints>"
+                        end_idx = raw.find(end_tag.encode("utf-8"))
+                        xml_data = raw[idx:end_idx + len(end_tag)]
+                        root_elem = ET.fromstring(xml_data)
+                        prod = root_elem.find("Product")
+                        name = prod.findtext("Name") or nicnt_path.stem
+                    else:
+                        name = nicnt_path.stem
+                except Exception:
+                    name = nicnt_path.stem
+
+                win_path = Path(root).as_posix().replace("/run/media/leonardo/Elements", "F:").replace("/", "\\")
+                found[name.lower()] = {
+                    "name": name,
+                    "path": win_path,
+                    "slug": nicnt_path.stem.lower()
+                }
+            elif nkis:
+                dir_name = Path(root).name
+                if dir_name.lower() not in ("instruments", "instrument", "samples", "sample", "multis"):
+                    name = dir_name
+                else:
+                    name = Path(root).parent.name
+
+                if name.lower() not in found and not name.lower().startswith("template"):
+                    win_path = Path(root).as_posix().replace("/run/media/leonardo/Elements", "F:").replace("/", "\\")
+                    found[name.lower()] = {
+                        "name": name,
+                        "path": win_path,
+                        "slug": name.lower()
+                    }
+    return found
+
 def installed_content(root):
     """`library name` → content folder, from Native Access' installed_products."""
     products = root / "Users/Public/Documents/Native Instruments/installed_products"
@@ -84,12 +142,18 @@ def main():
     if not roots:
         sys.exit("no Windows drive or Wine prefix found; pass --root")
     libraries = {}
+    # 1. First load plugins folder libraries (with real files on disk)
+    for key, info in scan_plugins_folder().items():
+        libraries[key] = info
+
+    # 2. Add meta names and installed products from Windows / Wine
     for root in roots:
         for key, info in meta_names(root).items():
             libraries.setdefault(key, info)
         for key, content in installed_content(root).items():
             libraries.setdefault(key, {"name": key.title(), "path": "", "slug": key})
-            libraries[key]["path"] = content
+            if content:
+                libraries[key]["path"] = content
     rows = sorted(libraries.values(), key=lambda item: item["name"].lower())
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

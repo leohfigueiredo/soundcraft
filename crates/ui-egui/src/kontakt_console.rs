@@ -22,11 +22,11 @@ pub const PALETTE: Palette = Palette {
 };
 
 pub const CATEGORIES: &[Category] = &[
+    Category { title: "PIANOS & KEYS" },
+    Category { title: "SYNTHS & MOTIF" },
+    Category { title: "PADS & ATMOSPHERES" },
+    Category { title: "ACOUSTIC & STRINGS" },
     Category { title: "LIBRARIES" },
-    Category { title: "ORCHESTRAL" },
-    Category { title: "DRUMS" },
-    Category { title: "SYNTHS" },
-    Category { title: "WORLD" },
 ];
 
 pub const VARIANTS: &[&str] = &["Default", "Close Mic", "Room", "Bright", "Warm"];
@@ -367,17 +367,40 @@ pub const HEADER: &[Spec] = &[Spec {
 pub const SELECTS: &[Select] = &[Select { id: "filter_type", label: "FILTER", group: 2, options: FILTER_TYPES, cc: 44, automation: "Filter Type" }];
 
 pub const MODELS: &[Model] = &[
-    Model { category: 0, name: "Grand Piano", program: 0, icon: Icon::Grand, preset: None },
-    Model { category: 0, name: "Felt Piano", program: 1, icon: Icon::Grand, preset: None },
-    Model { category: 0, name: "Choir Library", program: 2, icon: Icon::Strings, preset: None },
-    Model { category: 1, name: "String Ensemble", program: 3, icon: Icon::Strings, preset: None },
-    Model { category: 1, name: "Solo Cello", program: 4, icon: Icon::Strings, preset: None },
-    Model { category: 2, name: "Studio Kit", program: 5, icon: Icon::Sampler, preset: None },
-    Model { category: 2, name: "Vintage Kit", program: 6, icon: Icon::Sampler, preset: None },
-    Model { category: 3, name: "Hybrid Synth", program: 7, icon: Icon::Synth, preset: None },
-    Model { category: 3, name: "Analogue Brass", program: 8, icon: Icon::Brass, preset: None },
-    Model { category: 4, name: "Balinese Gamelan", program: 9, icon: Icon::Mallet, preset: None },
-    Model { category: 4, name: "Taiko Ensemble", program: 10, icon: Icon::Sampler, preset: None },
+    // Category 0: PIANOS & KEYS
+    Model { category: 0, name: "Nord Piano 3", program: 0, icon: Icon::Grand, preset: None },
+    Model { category: 0, name: "Red Pianos Gold", program: 1, icon: Icon::Grand, preset: None },
+    Model { category: 0, name: "Ultimate Stage Pianos", program: 2, icon: Icon::Grand, preset: None },
+    Model { category: 0, name: "Steinway Grand", program: 3, icon: Icon::Grand, preset: None },
+    Model { category: 0, name: "Matt's Fender Rhodes", program: 4, icon: Icon::Keys, preset: None },
+    Model { category: 0, name: "Electro-Acoustic Piano", program: 5, icon: Icon::Keys, preset: None },
+    Model { category: 0, name: "Yamaha S700", program: 6, icon: Icon::Grand, preset: None },
+
+    // Category 1: SYNTHS & MOTIF
+    Model { category: 1, name: "Yamaha Montage 8", program: 7, icon: Icon::Keys, preset: None },
+    Model { category: 1, name: "MONTAGE FULL J", program: 8, icon: Icon::Keys, preset: None },
+    Model { category: 1, name: "Yamaha Motif XF", program: 9, icon: Icon::Keys, preset: None },
+    Model { category: 1, name: "MOTIF EPs", program: 10, icon: Icon::Keys, preset: None },
+    Model { category: 1, name: "CW - Clássicos", program: 11, icon: Icon::Keys, preset: None },
+    Model { category: 1, name: "CW - Essential Waves", program: 12, icon: Icon::Synth, preset: None },
+    Model { category: 1, name: "CW - Synths Flow", program: 13, icon: Icon::Synth, preset: None },
+    Model { category: 1, name: "WORSHIP XP80", program: 14, icon: Icon::Synth, preset: None },
+
+    // Category 2: PADS & ATMOSPHERES
+    Model { category: 2, name: "Mosaic Pads", program: 15, icon: Icon::Strings, preset: None },
+    Model { category: 2, name: "Grands PADs", program: 16, icon: Icon::Strings, preset: None },
+    Model { category: 2, name: "Amazing Pads", program: 17, icon: Icon::Strings, preset: None },
+    Model { category: 2, name: "Other Worlds Evolved", program: 18, icon: Icon::Synth, preset: None },
+    Model { category: 2, name: "RA_CINEMATRIX", program: 19, icon: Icon::Sampler, preset: None },
+
+    // Category 3: ACOUSTIC & STRINGS
+    Model { category: 3, name: "Biblioteca de Timbres", program: 20, icon: Icon::Sampler, preset: None },
+    Model { category: 3, name: "Setup de Milhões", program: 21, icon: Icon::Keys, preset: None },
+    Model { category: 3, name: "Nord Stage 2", program: 22, icon: Icon::Grand, preset: None },
+
+    // Category 4: LIBRARIES
+    Model { category: 4, name: "Kontakt 7", program: 23, icon: Icon::Sampler, preset: None },
+    Model { category: 4, name: "Kontakt 8", program: 24, icon: Icon::Sampler, preset: None },
 ];
 
 pub static PROFILE: Profile = Profile {
@@ -404,8 +427,8 @@ pub static PROFILE: Profile = Profile {
     selects: SELECTS,
     library_picker: Some((0, "kontakt_library")),
     velocity_curve: true,
-    program_change: true,
-    capture_first: false,
+    program_change: false,
+    capture_first: true,
 };
 
 /// A parameter of the Kontakt console.

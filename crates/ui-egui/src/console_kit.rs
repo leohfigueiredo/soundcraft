@@ -859,16 +859,18 @@ pub fn open_for_track(app: &mut SoundApp, track: soundcraft_model::TrackId) {
     let edit = &mut app.engine.session_mut().edit;
     edit.selected_tracks.clear();
     edit.selected_tracks.push(track);
-    open(app, id);
+    // Ensure the console profile is synchronized with the selected track's instrument
+    app.ui.console_profile = id.to_string();
+    if !app.ui.show_console {
+        app.ui.show_console = true;
+    }
 }
 
 pub fn open(app: &mut SoundApp, id: &str) {
     // When switching instruments, don't re-open the console window
     // to prevent interference with the plugin state
-    if app.ui.show_console {
-        app.ui.console_profile = id.to_string();
-    } else {
-        app.ui.console_profile = id.to_string();
+    app.ui.console_profile = id.to_string();
+    if !app.ui.show_console {
         app.ui.show_console = true;
     }
 }
@@ -910,9 +912,21 @@ fn instrument_tabs(app: &mut SoundApp, ui: &mut Ui) {
                 // The tab carries the VST's name, and a dot when it is the instrument loaded on the
                 // active track (so the tab row answers "which VST am I driving?").
                 let loaded_here = active_instrument_matches(app, profile);
-                let label = if loaded_here { format!("● {}", profile.name) } else { profile.name.to_string() };
+                let label = if loaded_here {
+                    format!("[{}]", profile.name) // box indicator for loaded instrument
+                } else {
+                    profile.name.to_string()
+                };
+                // Use green accent when both selected AND instrument loaded here for maximum visibility
+                let text_color = if on && loaded_here {
+                    palette.accent  // bright green from the palette to highlight the active instrument tab
+                } else if on {
+                    Color32::BLACK
+                } else {
+                    palette.text
+                };
                 let text =
-                    RichText::new(label).font(if on { bold(10.0) } else { regular(10.0) }).color(if on { Color32::BLACK } else { palette.text });
+                    RichText::new(label).font(if on { bold(10.0) } else { regular(10.0) }).color(text_color);
                 let button = egui::Button::new(text)
                     .fill(if on { profile.palette.accent } else { palette.panel_head })
                     .stroke(Stroke::new(1.0, if on { profile.palette.accent } else { palette.line }))
@@ -926,7 +940,7 @@ fn instrument_tabs(app: &mut SoundApp, ui: &mut Ui) {
                         ui.add(button)
                     })
                     .inner;
-                if resp.on_hover_text(format!("{} — {} · {}", profile.brand, profile.kind, profile.tagline)).clicked() && !on {
+                if resp.on_hover_text(if loaded_here { format!("{} (loaded here)", profile.name) } else { format!("{} — {} · {}", profile.brand, profile.kind, profile.tagline) }).clicked() && !on {
                     app.ui.console_profile = profile.id.to_string();
                     // Prefer to load the plugin on the currently selected instrument track if Alt GUI is open.
                     // If no track is selected (unlikely in Alt context), fall back to searching for a matching track.
@@ -953,6 +967,20 @@ fn instrument_tabs(app: &mut SoundApp, ui: &mut Ui) {
             });
         });
     });
+
+    // Case-3 indicator: no track selected but the active console is owned by a specific instrument
+    // track (set in `follow_selection`). Show a subtle banner so the user knows where the knobs go.
+    if let Some(owner_id) = app.ui.console_followed {
+        if let Some(t) = app.engine.session().track(owner_id) {
+            let prof = active(app);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("◆").font(regular(8.5)).color(palette.accent));
+                ui.label(RichText::new(format!("CONSOLE OWNED BY: {} — {}", t.name, prof.id))
+                    .font(bold(8.5)).color(palette.text_dim));
+            });
+        }
+    }
 }
 
 /// True when the instrument on the active track is this profile (matched by the plugin's name or
@@ -1801,8 +1829,11 @@ mod tests {
 }
 
 /// The instrument console follows the selected instrument track if one is selected.
+/// Also syncs back: when user changes profile manually, updates selection to show which track owns it.
 pub fn follow_selection(app: &mut SoundApp) {
     let s = app.engine.session();
+
+    // Case 1: Track selected with instrument → sync console profile (original logic)
     if let Some(&sel) = s.edit.selected_tracks.first()
         && let Some(t) = s.track(sel)
         && let Some(ins) = &t.instrument
@@ -1810,5 +1841,36 @@ pub fn follow_selection(app: &mut SoundApp) {
         && app.ui.console_profile != p.id
     {
         app.ui.console_profile = p.id.to_string();
+        // A track is now selected → the "console owned by" banner no longer applies
+        app.ui.console_followed = None;
+        return; // sync done, skip bidirectional logic below
+    }
+
+    // Case 2: Track selected but no instrument → clear console profile or keep current
+    if let Some(&sel) = s.edit.selected_tracks.first()
+        && let Some(t) = s.track(sel)
+        && t.instrument.is_none()
+        && !app.ui.console_profile.is_empty()
+    {
+        // A track is selected (even without instrument) → clear the owned-console banner
+        app.ui.console_followed = None;
+        // Don't auto-clear when track has no instrument — user may want to keep the last console open
+        return;
+    }
+
+    // Case 3: No track selected but console profile is set → find which track owns it and show indicator
+    if !app.ui.console_profile.is_empty() && s.edit.selected_tracks.is_empty() {
+        if let Some(t) = s.tracks.iter().find(|t| {
+            t.instrument.as_ref().and_then(|ins| profile_for_plugin(&ins.plugin))
+                .map_or(false, |p| p.id == app.ui.console_profile)
+        }) {
+            // Track owns the active console — set visual indicator
+            app.ui.console_followed = Some(t.id);
+        } else if let Some(owned) = &app.ui.console_followed {
+            // Profile no longer matches any track → clear indicator
+            if !s.tracks.iter().any(|t| t.id == *owned && t.instrument.is_some()) {
+                app.ui.console_followed = None;
+            }
+        }
     }
 }

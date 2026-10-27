@@ -129,7 +129,9 @@ impl Compressor {
         self.gr
     }
 
-    /// Process with key input - when sidechain is enabled, use the provided key level instead of signal level
+    /// Process with key input - when sidechain is enabled, use the provided key level instead of signal level.
+    /// Kept for planned sidechain/key-input support; wired to Compressor::key_input in a future commit.
+    #[allow(dead_code)] // reserved for sidechain/key input path
     #[inline]
     fn gain_for_key(&mut self, key_level: f32) -> f32 {
         let ratio = if self.limiting() { 1000.0 } else { self.p.v(1) };

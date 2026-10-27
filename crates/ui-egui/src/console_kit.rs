@@ -417,6 +417,7 @@ pub struct Profile {
     pub velocity_curve: bool,
     /// Send a program change when a model is picked.
     pub program_change: bool,
+    pub capture_first: bool,
 }
 
 impl Profile {
@@ -822,32 +823,63 @@ pub fn delete_captured_preset(profile: &'static Profile, name: &str) -> Result<(
 /// Applies the instrument's preset to the plugin on the active track: the plugin's own program
 /// list first (IUnitInfo), then a state saved from that instrument, and the caller falls back to a
 /// MIDI program change. Returns what happened, for the status line.
-pub fn apply_preset(app: &SoundApp, profile: &'static Profile, model: &Model) -> (bool, String) {
+pub fn apply_preset(app: &mut SoundApp, profile: &'static Profile, model: &Model) -> (bool, String) {
     let Some(track) = crate::virtual_keyboard::active_target_track(app) else { return (false, "no instrument track selected".into()) };
     let Some(player) = app.player.as_ref() else { return (false, "no audio engine".into()) };
     let slot = soundcraft_mix::INSTRUMENT_SLOT;
-    let key = preset_key(model).to_ascii_lowercase();
-    // 1. The plugin's own program list.
+    let key = preset_key(model);
+
+    // 1. A state saved/bound for this instrument model (exact name, capture: prefix, or case-insensitive).
+    let map = saved_presets(profile.id);
+    let state_b64 = map.get(key)
+        .or_else(|| map.get(&format!("capture:{key}")))
+        .or_else(|| {
+            let target = key.to_ascii_lowercase();
+            map.iter().find_map(|(k, v)| {
+                let clean = k.strip_prefix("capture:").unwrap_or(k).trim().to_ascii_lowercase();
+                if clean == target { Some(v) } else { None }
+            })
+        });
+
+    if let Some(state) = state_b64.and_then(|b| soundcraft_engine::model::b64::decode(b)) {
+        player.load_plugin_state(track, slot, state);
+        if let Some(inst) = app.engine.session_mut().track_mut(track).and_then(|t| t.instrument.as_mut()) {
+            inst.state = state_b64.map(|s| s.to_string());
+        }
+        return (true, format!("{} → loaded sound", model.name));
+    }
+
+    // 2. The plugin's own program list (only if it matches by non-generic name).
     let lists = player.plugin_programs(track, slot);
+    let key_lower = key.to_ascii_lowercase();
     for (li, list) in lists.iter().enumerate() {
-        if let Some((pi, name)) = list.programs.iter().enumerate().find(|(_, n)| n.to_ascii_lowercase().contains(&key)) {
+        if let Some((pi, name)) = list.programs.iter().enumerate().find(|(_, n)| {
+            let n_lower = n.to_ascii_lowercase();
+            !n_lower.is_empty()
+                && !n_lower.starts_with("programchange")
+                && !n_lower.starts_with("program ")
+                && n_lower.contains(&key_lower)
+        }) {
             player.select_plugin_program(track, slot, li, pi);
             return (true, format!("{} → preset `{name}`", model.name));
         }
     }
-    // 2. A state saved from this instrument.
-    if let Some(state) = saved_presets(profile.id).get(preset_key(model)).and_then(|b| soundcraft_engine::model::b64::decode(b)) {
-        player.load_plugin_state(track, slot, state);
-        return (true, format!("{} → saved preset", model.name));
-    }
-    // 3. Direct program index if published by the plugin (e.g. Pianoteq "Program 0..127").
-    if let Some((li, list)) = lists.iter().enumerate().find(|(_, l)| (model.program as usize) < l.programs.len()) {
+
+    // 3. Direct program index ONLY for plugins that explicitly support MIDI program change
+    // and are not capture-first/state-based.
+    if profile.program_change && !profile.capture_first
+        && let Some((li, list)) = lists.iter().enumerate().find(|(_, l)| (model.program as usize) < l.programs.len())
+    {
         player.select_plugin_program(track, slot, li, model.program as usize);
         let prog_name = list.programs.get(model.program as usize).map(|s| s.as_str()).unwrap_or("");
         return (true, format!("{} → program {} ({prog_name})", model.name, model.program));
     }
-    let what =
-        if lists.is_empty() { "the plugin publishes no program list".to_string() } else { format!("no program matches `{}`", preset_key(model)) };
+
+    let what = if lists.is_empty() {
+        "no saved sound bound".to_string()
+    } else {
+        format!("no saved sound or program matches `{key}`")
+    };
     (false, format!("{}: {what}", model.name))
 }
 
@@ -970,16 +1002,14 @@ fn instrument_tabs(app: &mut SoundApp, ui: &mut Ui) {
 
     // Case-3 indicator: no track selected but the active console is owned by a specific instrument
     // track (set in `follow_selection`). Show a subtle banner so the user knows where the knobs go.
-    if let Some(owner_id) = app.ui.console_followed {
-        if let Some(t) = app.engine.session().track(owner_id) {
-            let prof = active(app);
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("◆").font(regular(8.5)).color(palette.accent));
-                ui.label(RichText::new(format!("CONSOLE OWNED BY: {} — {}", t.name, prof.id))
-                    .font(bold(8.5)).color(palette.text_dim));
-            });
-        }
+    if let Some(t) = app.ui.console_followed.and_then(|owner_id| app.engine.session().track(owner_id)) {
+        let prof = active(app);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("◆").font(regular(8.5)).color(palette.accent));
+            ui.label(RichText::new(format!("CONSOLE OWNED BY: {} — {}", t.name, prof.id))
+                .font(bold(8.5)).color(palette.text_dim));
+        });
     }
 }
 
@@ -1319,14 +1349,14 @@ fn choose_model(app: &mut SoundApp, profile: &'static Profile, index: usize) {
     app.ui.status = if applied {
         status
     } else if let Some(track) = crate::virtual_keyboard::active_target_track(app) {
-        if profile.program_change {
+        if profile.program_change && !profile.capture_first {
             let msg = [0xC0 | (state(app, profile).channel & 0x0F), model.program, 0];
             app.send_live_midi(track, msg);
             record_sent(app, msg);
-            format!("Loaded {} (program {})", model.name, model.program)
+            format!("Program {} ({})", model.program, model.name)
         } else {
             crate::mix_window::open_native_gui(app, track, soundcraft_mix::INSTRUMENT_SLOT);
-            format!("{status}; opened the plugin to pick the sound")
+            format!("{status} (right-click to bind; opened plugin window)")
         }
     } else {
         format!("{status}; no {} track is loaded", profile.brand)
@@ -1369,7 +1399,7 @@ fn model_picker(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
                 }
                 ui.label(RichText::new(cat.title).font(bold(8.0)).color(p.text_dim));
                 for (i, m) in rows {
-                    let dot = if bound.contains_key(preset_key(m)) { "● " } else { "   " };
+                    let dot = if bound.contains_key(preset_key(m)) || bound.contains_key(&format!("capture:{}", preset_key(m))) { "● " } else { "   " };
                     if ui.selectable_label(i == selected, format!("{dot}{}", m.name)).clicked() {
                         pick = Some(i);
                         ui.close();
@@ -1420,7 +1450,11 @@ fn model_tabs(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
                         ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, p.accent), egui::StrokeKind::Inside);
                     }
                     // Bound = picking this instrument restores a saved sound by itself.
-                    let bound = saved_presets(profile.id).contains_key(preset_key(model));
+                    let map = saved_presets(profile.id);
+                    let key = preset_key(model);
+                    let bound = map.contains_key(key)
+                        || map.contains_key(&format!("capture:{key}"))
+                        || map.keys().any(|k| k.strip_prefix("capture:").unwrap_or(k).trim().eq_ignore_ascii_case(key));
                     if bound {
                         let dot = pos2(rect.max.x - 6.0, rect.max.y - 5.0);
                         ui.painter().circle_filled(dot, 2.2, if on { Color32::BLACK } else { p.live });
@@ -1431,9 +1465,16 @@ fn model_tabs(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
                     let info_label = model.name;
                     let info_selected = on;
                     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, info_selected, info_label));
-                    let resp = resp.on_hover_text(format!("{} — program {} (click or double-click to load)", model.name, model.program));
+                    let resp = resp.on_hover_text(format!("{} (click to load sound · right-click to bind current sound)", model.name));
                     if resp.clicked() || resp.double_clicked() {
                         choose_model(app, profile, i);
+                    }
+                    if resp.secondary_clicked() {
+                        if let Err(e) = save_preset(app, profile, model) {
+                            app.ui.status = format!("Could not save sound: {e}");
+                        } else {
+                            app.ui.status = format!("Saved current sound to {}", model.name);
+                        }
                     }
                 }
             });
@@ -1784,6 +1825,53 @@ fn keyboard_strip(app: &mut SoundApp, ui: &mut Ui, profile: &'static Profile) {
     }
 }
 
+/// The instrument console follows the selected instrument track if one is selected.
+/// Also syncs back: when user changes profile manually, updates selection to show which track owns it.
+pub fn follow_selection(app: &mut SoundApp) {
+    let s = app.engine.session();
+
+    // Case 1: Track selected with instrument → sync console profile (original logic)
+    if let Some(&sel) = s.edit.selected_tracks.first()
+        && let Some(t) = s.track(sel)
+        && let Some(ins) = &t.instrument
+        && let Some(p) = profile_for_plugin(&ins.plugin)
+        && app.ui.console_profile != p.id
+    {
+        app.ui.console_profile = p.id.to_string();
+        // A track is now selected → the "console owned by" banner no longer applies
+        app.ui.console_followed = None;
+        return; // sync done, skip bidirectional logic below
+    }
+
+    // Case 2: Track selected but no instrument → clear console profile or keep current
+    if let Some(&sel) = s.edit.selected_tracks.first()
+        && let Some(t) = s.track(sel)
+        && t.instrument.is_none()
+        && !app.ui.console_profile.is_empty()
+    {
+        // A track is selected (even without instrument) → clear the owned-console banner
+        app.ui.console_followed = None;
+        // Don't auto-clear when track has no instrument — user may want to keep the last console open
+        return;
+    }
+
+    // Case 3: No track selected but console profile is set → find which track owns it and show indicator
+    if !app.ui.console_profile.is_empty() && s.edit.selected_tracks.is_empty() {
+        if let Some(t) = s.tracks.iter().find(|t| {
+            t.instrument.as_ref().and_then(|ins| profile_for_plugin(&ins.plugin))
+                .is_some_and(|p| p.id == app.ui.console_profile)
+        }) {
+            // Track owns the active console — set visual indicator
+            app.ui.console_followed = Some(t.id);
+        } else if let Some(owned) = &app.ui.console_followed {
+            // Profile no longer matches any track → clear indicator
+            if !s.tracks.iter().any(|t| t.id == *owned && t.instrument.is_some()) {
+                app.ui.console_followed = None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1819,6 +1907,7 @@ mod tests {
         library_picker: None,
         velocity_curve: false,
         program_change: false,
+        capture_first: false,
     };
 
     #[test]
@@ -1891,49 +1980,3 @@ mod tests {
     }
 }
 
-/// The instrument console follows the selected instrument track if one is selected.
-/// Also syncs back: when user changes profile manually, updates selection to show which track owns it.
-pub fn follow_selection(app: &mut SoundApp) {
-    let s = app.engine.session();
-
-    // Case 1: Track selected with instrument → sync console profile (original logic)
-    if let Some(&sel) = s.edit.selected_tracks.first()
-        && let Some(t) = s.track(sel)
-        && let Some(ins) = &t.instrument
-        && let Some(p) = profile_for_plugin(&ins.plugin)
-        && app.ui.console_profile != p.id
-    {
-        app.ui.console_profile = p.id.to_string();
-        // A track is now selected → the "console owned by" banner no longer applies
-        app.ui.console_followed = None;
-        return; // sync done, skip bidirectional logic below
-    }
-
-    // Case 2: Track selected but no instrument → clear console profile or keep current
-    if let Some(&sel) = s.edit.selected_tracks.first()
-        && let Some(t) = s.track(sel)
-        && t.instrument.is_none()
-        && !app.ui.console_profile.is_empty()
-    {
-        // A track is selected (even without instrument) → clear the owned-console banner
-        app.ui.console_followed = None;
-        // Don't auto-clear when track has no instrument — user may want to keep the last console open
-        return;
-    }
-
-    // Case 3: No track selected but console profile is set → find which track owns it and show indicator
-    if !app.ui.console_profile.is_empty() && s.edit.selected_tracks.is_empty() {
-        if let Some(t) = s.tracks.iter().find(|t| {
-            t.instrument.as_ref().and_then(|ins| profile_for_plugin(&ins.plugin))
-                .map_or(false, |p| p.id == app.ui.console_profile)
-        }) {
-            // Track owns the active console — set visual indicator
-            app.ui.console_followed = Some(t.id);
-        } else if let Some(owned) = &app.ui.console_followed {
-            // Profile no longer matches any track → clear indicator
-            if !s.tracks.iter().any(|t| t.id == *owned && t.instrument.is_some()) {
-                app.ui.console_followed = None;
-            }
-        }
-    }
-}

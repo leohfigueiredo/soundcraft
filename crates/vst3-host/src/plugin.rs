@@ -226,10 +226,8 @@ impl Plugin for Vst3Plugin {
         // processor with the next block (a separate controller does not share state with it).
         match self.inst.select_program(list, program) {
             Ok((id, normalized)) => {
-                if let Some(pos) = self.ids.iter().position(|&vid| vid == id) {
-                    if let Some(slot) = self.values.get_mut(pos) {
-                        *slot = program as f32;
-                    }
+                if let Some(slot) = self.ids.iter().position(|&vid| vid == id).and_then(|pos| self.values.get_mut(pos)) {
+                    *slot = program as f32;
                 }
                 if let Some(e) = self.pending.iter_mut().find(|(pid, _)| *pid == id) {
                     e.1 = normalized;
@@ -368,11 +366,7 @@ impl Plugin for Vst3Plugin {
         self.transport = Some(*transport);
     }
     fn set_sample(&mut self, sample: Option<Arc<dyn soundcraft_dsp::SampleSource>>) -> bool {
-        if let Some(_s) = sample {
-            true
-        } else {
-            false
-        }
+        sample.is_some()
     }
 
     fn tail_samples(&self) -> usize {

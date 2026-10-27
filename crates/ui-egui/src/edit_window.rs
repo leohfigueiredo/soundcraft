@@ -1157,12 +1157,11 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
                         let session = app.engine.session_mut();
                         session.edit.selected_tracks = vec![id];
                         // Sync Alt GUI console profile to selected track's instrument
-                        if let Some(track) = session.track(id) {
-                            if let Some(instrument) = &track.instrument {
-                                if let Some(profile) = crate::console_kit::profile_for_plugin(&instrument.plugin) {
-                                    app.ui.console_profile = profile.id.to_string();
-                                }
-                            }
+                        if let Some(profile) = session.track(id)
+                            .and_then(|t| t.instrument.as_ref())
+                            .and_then(|inst| crate::console_kit::profile_for_plugin(&inst.plugin))
+                        {
+                            app.ui.console_profile = profile.id.to_string();
                         }
                     }
                 }

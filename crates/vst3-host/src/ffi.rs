@@ -3010,10 +3010,8 @@ mod window {
                 let mut protocols = [delete_atom];
                 x_set_wm_protocols(display, window, protocols.as_mut_ptr(), 1);
                 x_select_input(display, window, STRUCTURE_NOTIFY_MASK);
-                if let Some(parent) = find_app_window(display, window) {
-                    if parent != window {
-                        x_set_transient_for_hint(display, window, parent);
-                    }
+                if let Some(parent) = find_app_window(display, window).filter(|&p| p != window) {
+                    x_set_transient_for_hint(display, window, parent);
                 }
                 let wm_state = x_intern_atom(display, c"_NET_WM_STATE".as_ptr(), 0);
                 let above = x_intern_atom(display, c"_NET_WM_STATE_ABOVE".as_ptr(), 0);

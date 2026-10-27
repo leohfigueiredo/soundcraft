@@ -2275,11 +2275,9 @@ mod hostwin {
             }
             inner.set_fixed_size(width, height);
             inner.set_longs(inner.atom(c"_NET_WM_PID"), XA_CARDINAL, &[c_ulong::from(std::process::id())]);
-            if let Some(owner) = find_app_window(display) {
-                if owner != window {
-                    // SAFETY: as above; `owner` is a window id read from the server.
-                    unsafe { XSetTransientForHint(display, window, owner) };
-                }
+            if let Some(owner) = find_app_window(display).filter(|&o| o != window) {
+                // SAFETY: as above; `owner` is a window id read from the server.
+                unsafe { XSetTransientForHint(display, window, owner) };
             }
             // `_NET_WM_STATE_ABOVE`, set before mapping as EWMH asks, also keeps the editor over
             // other applications (the same choice as the VST3 host; see docs/audit-report.md §2.1).

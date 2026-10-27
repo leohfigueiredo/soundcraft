@@ -305,6 +305,7 @@ pub static PROFILE: Profile = Profile {
     library_picker: None,
     velocity_curve: true,
     program_change: true,
+    capture_first: false,
 };
 
 /// A parameter of the LABS console.

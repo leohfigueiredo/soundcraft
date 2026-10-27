@@ -207,7 +207,8 @@ pub static PROFILE: Profile = Profile {
     selects: SELECTS,
     library_picker: None,
     velocity_curve: true,
-    program_change: true,
+    program_change: false,
+    capture_first: true,
 };
 
 /// A parameter of the Pigments console.

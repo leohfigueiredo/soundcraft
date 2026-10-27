@@ -117,8 +117,7 @@ def build_state(lib_dir, preset_file, win_dir):
     groups = root.find("groups")
     if groups is not None:
         for gi, group in enumerate(groups.findall("group")):
-            if group.find("effects") is None:
-                XM.SubElement(group, "effects")
+            # no fake effects
             for sample in group.findall("sample"):
                 rel = sample.get("path", "")
                 info = wav_info(os.path.join(lib_dir, *rel.replace("\\", "/").split("/")))

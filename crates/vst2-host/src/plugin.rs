@@ -118,11 +118,7 @@ impl Plugin for Vst2Plugin {
 
     fn set_transport(&mut self, _transport: &Transport) {}
     fn set_sample(&mut self, sample: Option<Arc<dyn soundcraft_dsp::SampleSource>>) -> bool {
-        if let Some(_s) = sample {
-            true
-        } else {
-            false
-        }
+        sample.is_some()
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
